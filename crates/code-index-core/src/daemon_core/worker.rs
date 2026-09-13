@@ -6,6 +6,7 @@
 // `shutdown_rx` (broadcast).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -87,6 +88,7 @@ struct BatchContext<'a> {
     /// Настройки индексации папки — нужны, когда пачка велика и её выгоднее
     /// обработать полным проходом, а не по одному файлу.
     index_config: &'a IndexConfig,
+    stop: &'a AtomicBool,
 }
 
 /// Паузы перед повторной попыткой прочитать занятый файл, в секундах. Длина
@@ -213,6 +215,9 @@ fn process_batch(
     // «сбоев N», и выяснять, какие это файлы, приходится с включённой отладкой.
     let mut stuck_names: Vec<String> = Vec::new();
     for event in batch {
+        if ctx.stop.load(Ordering::Acquire) {
+            break;
+        }
         match apply_event(
             storage,
             ctx.path,
@@ -256,9 +261,11 @@ fn process_batch(
         }
     }
 
+    let processed_batch = &batch[..done];
+
     // Этапы ядра пофайлово отмечает `apply_event` — те же имена, что при полной
     // индексации. Здесь остаётся проставить, сколько файлов прошло через них.
-    let applied = crate::logging::plural(batch_len as u64, "файл", "файла", "файлов");
+    let applied = crate::logging::plural(done as u64, "файл", "файла", "файлов");
     let applied = if failed > 0 {
         format!("{}, сбоев {}", applied, failed)
     } else {
@@ -331,7 +338,7 @@ fn process_batch(
         if let Some(proc) = ctx.resolved_processor {
             let mut changed_paths: Vec<PathBuf> = Vec::new();
             let mut deleted_paths: Vec<PathBuf> = Vec::new();
-            for event in batch {
+            for event in processed_batch {
                 match event {
                     FileEvent::Modified(p) | FileEvent::Created(p) => {
                         changed_paths.push(p.clone())
@@ -367,12 +374,12 @@ fn process_batch(
     finish_batch(
         ctx,
         storage,
-        batch,
+        processed_batch,
         BatchResult {
             commit_ok,
             failed,
             busy,
-            batch_len,
+            batch_len: done,
             extras_ok,
             extras_ms,
             started: batch_started,
@@ -416,7 +423,12 @@ fn process_batch_full_pass(
     let parse_collector = ctx.resolved_processor.and_then(|proc| proc.parse_collector());
     let core_ok = {
         let mut indexer = Indexer::with_config(storage, ctx.index_config.clone());
-        match indexer.full_reindex_with_collector(ctx.path, false, parse_collector.as_deref()) {
+        match indexer.full_reindex_with_collector_and_stop(
+            ctx.path,
+            false,
+            parse_collector.as_deref(),
+            Some(ctx.stop),
+        ) {
             Ok(result) => {
                 tracing::info!(
                     "[{}] пакетная обработка закончена: просмотрено {} файлов — записано {}, \
@@ -440,6 +452,11 @@ fn process_batch_full_pass(
             }
         }
     };
+
+    if ctx.stop.load(Ordering::Acquire) {
+        mark_incomplete(storage, ctx.path);
+        return BatchStep::Stop;
+    }
 
     let mut extras_ok = true;
     let mut extras_ms: u128 = 0;
@@ -635,6 +652,16 @@ fn fail_worker(state: &DaemonState, path: &Path, reason: String) {
     });
 }
 
+fn mark_incomplete(storage: &Storage, path: &Path) {
+    if let Err(e) = storage.set_bulk_in_progress(true) {
+        tracing::warn!(
+            "[{}] не удалось отметить незавершённую индексацию: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
 /// Выполнить initial reindex и запустить watcher-цикл для одной папки.
 ///
 /// Функция блокирующая. Runner вызывает её через `spawn_blocking`. По завершении
@@ -655,11 +682,15 @@ pub fn run_worker(
     entry: PathEntry,
     state: DaemonState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    stop: Arc<AtomicBool>,
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
     processor_registry: Option<Arc<ProcessorRegistry>>,
     cache_client: Option<Arc<CacheClient>>,
 ) {
+    if shutdown_received(&mut shutdown_rx, &stop) {
+        return;
+    }
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -720,7 +751,7 @@ pub fn run_worker(
             sem.available_permits()
         );
     }
-    let _permit = match tokio_block_on_value(acquire_initial_slot(initial_limiter)) {
+    let _permit = match tokio_block_on_value(acquire_initial_slot(initial_limiter, stop.clone())) {
         Ok(permit) => permit,
         Err(SlotClosed) => {
             // Семафор закрывают при остановке демона. Это штатное завершение:
@@ -733,6 +764,9 @@ pub fn run_worker(
             return;
         }
     };
+    if shutdown_received(&mut shutdown_rx, &stop) {
+        return;
+    }
 
     // 4. Выставить статус InitialIndexing ПОСЛЕ получения permit — иначе
     // папки-кандидаты показываются как активно индексируются, хотя на самом
@@ -899,9 +933,15 @@ pub fn run_worker(
     let parse_collector = resolved_processor
         .as_ref()
         .and_then(|proc| proc.parse_collector());
+    let incomplete_before_reindex = storage.bulk_in_progress();
     let indexer_result = {
         let mut indexer = Indexer::with_config(&mut storage, index_config.clone());
-        indexer.full_reindex_with_collector(&path, false, parse_collector.as_deref())
+        indexer.full_reindex_with_collector_and_stop(
+            &path,
+            false,
+            parse_collector.as_deref(),
+            Some(&stop),
+        )
     };
     let core_stages = crate::logging::stages_take();
     let reindex = match indexer_result {
@@ -928,6 +968,12 @@ pub fn run_worker(
         }
     };
 
+    if shutdown_received(&mut shutdown_rx, &stop) {
+        mark_incomplete(&storage, &path);
+        tracing::info!("[{}] индексация остановлена по сигналу", path.display());
+        return;
+    }
+
     // 6a. index_extras процессора — для BSL это парсинг Configuration.xml /
     //     Forms / EventSubscriptions и заполнение metadata_*-таблиц.
     //
@@ -950,7 +996,8 @@ pub fn run_worker(
         // минуты). Любое изменение данных, новая БД или пустые extras → полный
         // проход как раньше. Инкрементальные правки покрывает watcher-цикл через
         // index_extras_for_files.
-        let skip_extras = db_has_rows
+        let skip_extras = !incomplete_before_reindex
+            && db_has_rows
             && reindex.files_indexed == 0
             && reindex.files_deleted == 0
             && proc.extras_present(&storage);
@@ -961,7 +1008,8 @@ pub fn run_worker(
         // больших конфигурациях стоит минуты недоступности (замер: 6 файлов из
         // 94 650 → 15,7 минуты), точечный отрабатывает за секунды. Полный
         // остаётся для новой БД, пустой надстройки и переполнения списка путей.
-        let incremental_extras = !skip_extras
+        let incremental_extras = !incomplete_before_reindex
+            && !skip_extras
             && db_has_rows
             && !reindex.paths_overflow
             && proc.extras_present(&storage);
@@ -1004,7 +1052,7 @@ pub fn run_worker(
             }
         }
 
-        if need_full {
+        if need_full && !stop.load(Ordering::Acquire) {
             let t0 = std::time::Instant::now();
             // Сообщаем о НАЧАЛЕ: на больших конфигурациях полный пересбор идёт
             // минутами, и если он встанет — в журнале должна остаться запись
@@ -1029,6 +1077,12 @@ pub fn run_worker(
                 );
             }
         }
+    }
+
+    if shutdown_received(&mut shutdown_rx, &stop) {
+        mark_incomplete(&storage, &path);
+        tracing::info!("[{}] индексация остановлена по сигналу", path.display());
+        return;
     }
 
     // 7. Если БД была новой и открылась в памяти — flush + reopen в disk.
@@ -1212,6 +1266,7 @@ pub fn run_worker(
         resolved_processor: resolved_processor.as_ref(),
         cache_client: cache_client.as_ref(),
         index_config: &index_config,
+        stop: &stop,
     };
 
     // Отложенные повторы по занятым файлам: путь → событие, счётчик попыток и
@@ -1223,7 +1278,7 @@ pub fn run_worker(
         std::collections::HashMap::new();
 
     loop {
-        if shutdown_received(&mut shutdown_rx) {
+        if shutdown_received(&mut shutdown_rx, &stop) {
             break;
         }
 
@@ -1319,10 +1374,29 @@ struct SlotClosed;
 /// воркера сторожем и запись в журнале, маскирующую настоящие аварии.
 async fn acquire_initial_slot(
     limiter: Option<Arc<Semaphore>>,
+    stop: Arc<AtomicBool>,
 ) -> Result<Option<OwnedSemaphorePermit>, SlotClosed> {
-    match limiter {
-        None => Ok(None),
-        Some(sem) => sem.acquire_owned().await.map(Some).map_err(|_| SlotClosed),
+    let Some(sem) = limiter else {
+        return if stop.load(Ordering::Acquire) {
+            Err(SlotClosed)
+        } else {
+            Ok(None)
+        };
+    };
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(SlotClosed);
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sem.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => return Ok(Some(permit)),
+            Ok(Err(_)) => return Err(SlotClosed),
+            Err(_) => {}
+        }
     }
 }
 
@@ -1509,14 +1583,20 @@ mod tests {
     /// Ограничение не задано — слот не нужен, воркер идёт дальше без ожидания.
     #[tokio::test]
     async fn без_ограничения_слот_не_требуется() {
-        assert!(acquire_initial_slot(None).await.unwrap().is_none());
+        assert!(acquire_initial_slot(None, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Обычный ход: свободный слот выдаётся.
     #[tokio::test]
     async fn свободный_слот_выдаётся() {
         let sem = Arc::new(Semaphore::new(1));
-        assert!(acquire_initial_slot(Some(sem)).await.unwrap().is_some());
+        assert!(acquire_initial_slot(Some(sem), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Регресс S-4: на закрытом семафоре раньше была паника `expect("semaphore
@@ -1527,9 +1607,58 @@ mod tests {
         let sem = Arc::new(Semaphore::new(1));
         sem.close();
         assert!(matches!(
-            acquire_initial_slot(Some(sem)).await,
+            acquire_initial_slot(Some(sem), Arc::new(AtomicBool::new(false))).await,
             Err(SlotClosed)
         ));
+    }
+
+    #[test]
+    fn собственный_и_общий_сигналы_останавливают_worker() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(4);
+        let mut first_rx = shutdown_tx.subscribe();
+        let mut second_rx = shutdown_tx.subscribe();
+        let first_stop = AtomicBool::new(false);
+        let second_stop = AtomicBool::new(false);
+
+        first_stop.store(true, Ordering::Release);
+        assert!(shutdown_received(&mut first_rx, &first_stop));
+        assert!(!shutdown_received(&mut second_rx, &second_stop));
+
+        shutdown_tx.send(()).unwrap();
+        assert!(shutdown_received(&mut second_rx, &second_stop));
+    }
+
+    #[tokio::test]
+    async fn собственный_сигнал_штатно_завершает_задачу_worker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let entry = crate::daemon_core::config::parse_str(&format!(
+            "[[paths]]\npath = '{}'\n",
+            tmp.path().display()
+        ))
+        .unwrap()
+        .paths
+        .remove(0);
+        let cfg = crate::daemon_core::config::DaemonFileConfig::default();
+        let state = DaemonState::new();
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let stop = Arc::new(AtomicBool::new(true));
+
+        let handle = tokio::task::spawn_blocking(move || {
+            run_worker(
+                entry,
+                state,
+                shutdown_tx.subscribe(),
+                stop,
+                None,
+                cfg.indexer,
+                None,
+                None,
+            );
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("worker должен заметить собственный сигнал")
+            .unwrap();
     }
 
     #[test]
@@ -1682,8 +1811,11 @@ mod tests {
     }
 }
 
-fn shutdown_received(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
-    matches!(rx.try_recv(), Ok(()))
+fn shutdown_received(
+    rx: &mut tokio::sync::broadcast::Receiver<()>,
+    stop: &AtomicBool,
+) -> bool {
+    stop.load(Ordering::Acquire) || matches!(rx.try_recv(), Ok(()))
 }
 
 /// Собрать список относительных file_path из batch'а FS-событий для отправки

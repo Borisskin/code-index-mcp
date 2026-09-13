@@ -5,6 +5,7 @@ pub mod hasher;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -17,6 +18,10 @@ use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
 use config::IndexConfig;
+
+fn stop_requested(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|signal| signal.load(Ordering::Acquire))
+}
 
 /// Во сколько раз работа в памяти обходится дороже веса исходников папки —
 /// значение по умолчанию.
@@ -233,6 +238,19 @@ impl<'a> Indexer<'a> {
         force: bool,
         collector: Option<&dyn crate::extension::ParseExtrasCollector>,
     ) -> Result<IndexResult> {
+        self.full_reindex_with_collector_and_stop(root, force, collector, None)
+    }
+
+    /// Вариант полного прохода для daemon-worker'а. Сигнал проверяется между
+    /// файлами обхода, порциями разбора и завершёнными транзакциями; открытая
+    /// транзакция никогда не обрывается.
+    pub(crate) fn full_reindex_with_collector_and_stop(
+        &mut self,
+        root: &Path,
+        force: bool,
+        collector: Option<&dyn crate::extension::ParseExtrasCollector>,
+        stop: Option<&AtomicBool>,
+    ) -> Result<IndexResult> {
         let start = std::time::Instant::now();
         let mut result = IndexResult {
             files_scanned: 0,
@@ -301,7 +319,12 @@ impl<'a> Indexer<'a> {
         }
         crate::logging::stage_begin("обход дерева и сверка файлов");
         let candidates_start = std::time::Instant::now();
-        let (entries, seen_paths) = self.collect_entries(root, &mut result)?;
+        let (entries, seen_paths, walk_cancelled) =
+            self.collect_entries(root, &mut result, stop)?;
+        if walk_cancelled {
+            result.elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(result);
+        }
         let entries_to_read = self.filter_entries_by_mtime(&entries, force, &existing_files, &mut result);
         let candidates_dur = candidates_start.elapsed();
         tracing::info!(
@@ -344,8 +367,13 @@ impl<'a> Indexer<'a> {
                 &existing_files,
                 &mut result,
                 &mut metadata_updates,
+                stop,
             ))
         };
+        if stop_requested(stop) {
+            result.elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(result);
+        }
 
         // Изменений нет — дальше все этапы отработают вхолостую и напечатают
         // по строке нулей каждый. Читать в них нечего, поэтому выходим сразу:
@@ -454,15 +482,42 @@ impl<'a> Indexer<'a> {
         // только внутри одного захода. Именно это, а не место базы, держит
         // потолок расхода — в памяти база или на диске, содержимое всё равно
         // читается и разбирается целиком.
+        let mut cancelled = false;
         match preread {
             Some(candidates) => {
-                self.process_chunk(
-                    candidates,
-                    &registry,
-                    collector,
-                    ChunkPolicy { skip_delete, existing_files: None, label: None },
-                    &mut result,
-                )?;
+                if stop.is_some() {
+                    let chunk_size = self.config.batch_size.max(1);
+                    let total = candidates.len().div_ceil(chunk_size);
+                    let mut iter = candidates.into_iter();
+                    for i in 0..total {
+                        if stop_requested(stop) {
+                            cancelled = true;
+                            break;
+                        }
+                        let chunk: Vec<_> = iter.by_ref().take(chunk_size).collect();
+                        self.process_chunk(
+                            chunk,
+                            &registry,
+                            collector,
+                            ChunkPolicy {
+                                skip_delete,
+                                existing_files: None,
+                                label: if total > 1 { Some((i + 1, total)) } else { None },
+                            },
+                            &mut result,
+                            stop,
+                        )?;
+                    }
+                } else {
+                    self.process_chunk(
+                        candidates,
+                        &registry,
+                        collector,
+                        ChunkPolicy { skip_delete, existing_files: None, label: None },
+                        &mut result,
+                        stop,
+                    )?;
+                }
             }
             None => {
                 let chunks = chunk_by_budget(&entries_to_read, self.config.chunk_budget_bytes);
@@ -475,35 +530,64 @@ impl<'a> Indexer<'a> {
                     );
                 }
                 for (i, chunk) in chunks.into_iter().enumerate() {
+                    if stop_requested(stop) {
+                        cancelled = true;
+                        break;
+                    }
                     let candidates = self.read_entries(
                         chunk,
                         force,
                         &existing_files,
                         &mut result,
                         &mut metadata_updates,
+                        stop,
                     );
-                    self.process_chunk(
-                        candidates,
-                        &registry,
-                        collector,
-                        ChunkPolicy {
-                            skip_delete,
-                            // При продолжении прерванной загрузки пакетного
-                            // удаления не было, а часть файлов в базе уже есть:
-                            // такие чистят свои прежние строки сами.
-                            existing_files: if resume { Some(&existing_files) } else { None },
-                            label: if total > 1 { Some((i + 1, total)) } else { None },
-                        },
-                        &mut result,
-                    )?;
+                    let candidate_chunk_size = if stop.is_some() {
+                        self.config.batch_size.max(1)
+                    } else {
+                        candidates.len().max(1)
+                    };
+                    let mut candidates = candidates.into_iter();
+                    loop {
+                        if stop_requested(stop) {
+                            cancelled = true;
+                            break;
+                        }
+                        let candidate_chunk: Vec<_> =
+                            candidates.by_ref().take(candidate_chunk_size).collect();
+                        if candidate_chunk.is_empty() {
+                            break;
+                        }
+                        self.process_chunk(
+                            candidate_chunk,
+                            &registry,
+                            collector,
+                            ChunkPolicy {
+                                skip_delete,
+                                // При продолжении прерванной загрузки пакетного
+                                // удаления не было, а часть файлов в базе уже есть:
+                                // такие чистят свои прежние строки сами.
+                                existing_files: if resume { Some(&existing_files) } else { None },
+                                label: if total > 1 { Some((i + 1, total)) } else { None },
+                            },
+                            &mut result,
+                            stop,
+                        )?;
+                    }
+                    if cancelled {
+                        break;
+                    }
                 }
             }
         }
+        cancelled |= stop_requested(stop);
 
         // Сброс остатка сырья сборщика extras и отметка «слои построены» —
         // серийно, после последней порции.
-        if let Some(collector) = collector {
-            collector.write(&mut *self.storage)?;
+        if !cancelled {
+            if let Some(collector) = collector {
+                collector.write(&mut *self.storage)?;
+            }
         }
 
         // Обновляем mtime/file_size для файлов с неизменённым содержимым.
@@ -546,8 +630,14 @@ impl<'a> Indexer<'a> {
             let idx_ms = idx_dur.as_millis();
             tracing::info!("индексы и полнотекстовый поиск готовы за {} мс", idx_ms);
             crate::logging::stage_done("индексы и полнотекстовый поиск", idx_dur);
-            // База снова согласована — отметку о незавершённой загрузке снимаем.
-            self.storage.set_bulk_in_progress(false)?;
+            // При штатном завершении база снова согласована. При остановке
+            // сохраняем отметку: следующий запуск дочитает недостающие файлы.
+            self.storage.set_bulk_in_progress(cancelled)?;
+        }
+
+        if cancelled {
+            result.elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(result);
         }
 
         // ── Этап 5: удаление устаревших записей ──────────────────────────────
@@ -655,6 +745,7 @@ impl<'a> Indexer<'a> {
         collector: Option<&dyn crate::extension::ParseExtrasCollector>,
         policy: ChunkPolicy<'_>,
         result: &mut IndexResult,
+        stop: Option<&AtomicBool>,
     ) -> Result<()> {
         if candidates.is_empty() {
             return Ok(());
@@ -678,8 +769,11 @@ impl<'a> Indexer<'a> {
         // clone, и весь прочитанный текст жил в памяти дважды.
         let mut parse_results: Vec<ParsedFile> = candidates
             .into_par_iter()
-            .map(|(rel_path, content, hash, category, mtime, file_size)| {
-                match category {
+            .filter_map(|(rel_path, content, hash, category, mtime, file_size)| {
+                if stop_requested(stop) {
+                    return None;
+                }
+                Some(match category {
                     FileCategory::Code(language) => {
                         // Определяем парсер по расширению файла
                         let ext = Path::new(rel_path.as_str())
@@ -733,7 +827,7 @@ impl<'a> Indexer<'a> {
                                     || !pr.classes.is_empty()
                                     || !pr.variables.is_empty()
                                 {
-                                    return ParsedFile::Code {
+                                    return Some(ParsedFile::Code {
                                         rel_path,
                                         content_hash: hash,
                                         language: "xml_1c".to_string(),
@@ -744,7 +838,7 @@ impl<'a> Indexer<'a> {
                                         text_for_fts: None,
                                         raw_content: content,
                                         content_blob: None,
-                                    };
+                                    });
                                 }
                             }
                         }
@@ -760,7 +854,7 @@ impl<'a> Indexer<'a> {
                         }
                     }
                     FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
-                }
+                })
             })
             .collect();
         let parse_dur = parse_start.elapsed();
@@ -770,6 +864,10 @@ impl<'a> Indexer<'a> {
             crate::logging::plural(parse_results.len() as u64, "файл", "файла", "файлов")
         ));
         crate::logging::stage_done("разбор файлов", parse_dur);
+
+        if stop_requested(stop) {
+            return Ok(());
+        }
 
         // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
         // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
@@ -1179,13 +1277,14 @@ impl<'a> Indexer<'a> {
     /// Первый проход: обойти директорию и собрать список файлов — пути,
     /// категорию, время изменения и размер. Содержимое НЕ читается.
     ///
-    /// Возвращает (entries, seen_paths). seen_paths используется для очистки
-    /// удалённых файлов без повторного обхода дерева.
+    /// Возвращает (entries, seen_paths, cancelled). seen_paths используется для
+    /// очистки удалённых файлов без повторного обхода дерева.
     fn collect_entries(
         &self,
         root: &Path,
         result: &mut IndexResult,
-    ) -> Result<(Vec<FileEntry>, HashSet<String>)> {
+        stop: Option<&AtomicBool>,
+    ) -> Result<(Vec<FileEntry>, HashSet<String>, bool)> {
         let config_for_filter = self.config.clone();
         let file_matcher = self.config.build_file_exclude_matcher();
 
@@ -1201,7 +1300,12 @@ impl<'a> Indexer<'a> {
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
 
+        let mut cancelled = false;
         for entry in walker.filter_map(|e| e.ok()) {
+            if stop_requested(stop) {
+                cancelled = true;
+                break;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -1280,7 +1384,7 @@ impl<'a> Indexer<'a> {
             });
         }
 
-        Ok((entries, seen_paths))
+        Ok((entries, seen_paths, cancelled))
     }
 
     /// Быстрая фильтрация по времени изменения и размеру — без чтения файлов.
@@ -1323,11 +1427,15 @@ impl<'a> Indexer<'a> {
         existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
         result: &mut IndexResult,
         metadata_updates: &mut Vec<(String, i64, i64)>,
+        stop: Option<&AtomicBool>,
     ) -> Vec<Candidate> {
         let read_results: Vec<_> = entries
             .par_iter()
-            .map(|entry| {
-                match hasher::file_hash(&entry.abs_path) {
+            .filter_map(|entry| {
+                if stop_requested(stop) {
+                    return None;
+                }
+                Some(match hasher::file_hash(&entry.abs_path) {
                     Ok((content, hash, is_binary)) => {
                         // Двоичный контент под видом code-файла (EDT-защищённые
                         // модули поставщика — .bsl с двоичным образом) переводим
@@ -1340,7 +1448,7 @@ impl<'a> Indexer<'a> {
                         Ok((entry.rel_path.clone(), content, hash, category, entry.mtime, entry.file_size))
                     }
                     Err(e) => Err((entry.rel_path.clone(), e.to_string())),
-                }
+                })
             })
             .collect();
 
@@ -1501,6 +1609,21 @@ class App:
         assert!(stats.total_functions >= 2, "минимум 2 функции: hello + run");
         assert!(stats.total_classes >= 1, "минимум 1 класс: App");
         assert!(stats.total_text_files >= 1, "минимум 1 текстовый файл: readme.md");
+    }
+
+    #[test]
+    fn сигнал_останавливает_полный_проход_до_записи() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("main.py"), "def stopped():\n    pass\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        let stop = AtomicBool::new(true);
+
+        let result = Indexer::new(&mut storage)
+            .full_reindex_with_collector_and_stop(tmp.path(), false, None, Some(&stop))
+            .unwrap();
+
+        assert_eq!(result.files_indexed, 0);
+        assert_eq!(storage.get_stats().unwrap().total_files, 0);
     }
 
 

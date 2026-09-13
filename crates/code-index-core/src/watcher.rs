@@ -6,6 +6,18 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Событие относится к одному из конфигурационных файлов и может менять его
+/// содержимое. События чтения отбрасываются: на Linux они иначе зацикливают
+/// watcher на собственном перечитывании конфига.
+pub(crate) fn is_config_change(
+    kind: &notify::EventKind,
+    paths: &[PathBuf],
+    targets: &[PathBuf],
+) -> bool {
+    !matches!(kind, notify::EventKind::Access(_))
+        && paths.iter().any(|path| targets.iter().any(|target| path == target))
+}
+
 /// Событие файловой системы
 #[derive(Debug, Clone)]
 pub enum FileEvent {

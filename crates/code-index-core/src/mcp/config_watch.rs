@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use notify_debouncer_full::{
     new_debouncer,
-    notify::{EventKind, RecommendedWatcher, RecursiveMode},
+    notify::{RecommendedWatcher, RecursiveMode},
     DebounceEventResult, Debouncer, RecommendedCache,
 };
 use tokio::sync::mpsc;
@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use super::CodeIndexServer;
 use crate::daemon_core::config;
 use crate::federation::reload::{absolute_path, ServeConfigReloader};
+use crate::watcher::is_config_change;
 
 /// Запускает background task, отслеживающий изменения `daemon.toml`.
 /// Возвращает `JoinHandle`, по которому caller может дождаться завершения
@@ -141,14 +142,6 @@ async fn run_federated_watch(reloader: ServeConfigReloader) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Событие достойно перечитывания конфига? Да — только если это правка
-/// самого `daemon.toml`, а не события по соседним файлам каталога и не
-/// событие доступа (открытие/закрытие на чтение).
-fn is_config_change(kind: &EventKind, paths: &[PathBuf], targets: &[PathBuf]) -> bool {
-    !matches!(kind, EventKind::Access(_))
-        && paths.iter().any(|path| targets.iter().any(|target| path == target))
 }
 
 /// Собрать `Debouncer` и подписать его на родительскую директорию
@@ -385,6 +378,7 @@ mod tests {
     #[test]
     fn access_events_do_not_trigger_reload() {
         use notify_debouncer_full::notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        use notify_debouncer_full::notify::EventKind;
 
         let target = PathBuf::from("/cfg/daemon.toml");
         let paths = vec![target.clone()];
@@ -421,6 +415,7 @@ mod tests {
     #[test]
     fn federated_filter_accepts_both_targets_only() {
         use notify_debouncer_full::notify::event::{AccessKind, AccessMode, ModifyKind};
+        use notify_debouncer_full::notify::EventKind;
 
         let serve = PathBuf::from("/cfg/serve.toml");
         let daemon = PathBuf::from("/cfg/daemon.toml");
