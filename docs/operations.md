@@ -22,18 +22,22 @@
    [[paths]]
    alias = "<alias>"
    ip = "<win-host>"
-   port = 8013
+   port = 8011
    ```
 
-**После правки** — рестарт обоих процессов `bsl-indexer.exe`:
-- `schtasks /End /TN CodeIndexDaemon && schtasks /Run /TN CodeIndexDaemon` поднимает оба (`daemon run` + `serve --port 8013`).
-- Дополнительно `Stop-Process -Id <mcp-cache-ci-pid> -Force` (на 8011) — иначе у клиентов остаются stale MCP sessions; supervisor его респавнит за пару секунд.
+**После правки** — перезапуск не нужен (с v1.1.0):
+- демон сам следит за `daemon.toml` и через полсекунды после сохранения начинает индексировать новый путь или перестаёт отслеживать убранный — без перезапуска. Ручной запасной путь — `"C:/tools/code-index/bsl-indexer.exe" daemon reload`. Если убрать каталог во время полной сборки надстройки 1С, остановка ждёт её окончания; вернуть тот же каталог в это время не получится — повторите сохранение или `daemon reload` позже.
+- `serve` сам следит за `serve.toml` и `daemon.toml` и перечитывает их через полсекунды после сохранения; открытые MCP-сессии клиентов не рвутся. Применить вручную и увидеть итог — `POST http://127.0.0.1:8011/reload`, ответ `{reloaded, generation, added, removed, changed, restart_required, error}`. Итог последней перечитки — поле `config_reload` инструмента `health`.
+- Порядок правки: сначала `daemon.toml`, потом `serve.toml`. Локальный алиас из `serve.toml` без записи в `daemon.toml` не применяется — serve оставляет прежнюю таблицу и пишет причину в `error`.
+- Только перезапуском `serve` применяются `[me].ip` и `[pool]`, а также перечень инструментов, массовый режим и лимиты ответа из `daemon.toml`.
 
 **Симптомы пропуска `serve.toml`:** daemon индексирует, SQLite в `<repo>/.code-index/` собирается, `get_stats(repo=None)` через прямой curl на daemon-port даёт `status: ready` — но `mcp__code-index__get_stats(repo="<alias>")` отвечает `"Неизвестный repo '<alias>'"`, потому что serve его не зарегистрировал.
 
 Этот пункт зафиксирован после реального инцидента 2026-05-14 при добавлении `librechat-src` (правил только daemon.toml). Карточка feedback `#1179` в rag-query.
 
 ## ⚡ HOT-RELOAD DAEMON CONFIG — НИКАКОГО РЕСТАРТА НЕ НУЖНО
+
+> С v1.1.0 демон перечитывает `daemon.toml` сам. Команда ниже нужна, только чтобы применить правку немедленно и увидеть ответ.
 
 **ПОСЛЕ ПРАВКИ `daemon.toml` (добавил новый репо, поменял языки, изменил лимиты) — НЕ ПЕРЕЗАПУСКАЙ DAEMON ЧЕРЕЗ `schtasks /End && /Run` И НЕ УБИВАЙ ПО PID. У DAEMON ЕСТЬ HOT-RELOAD CONFIG:**
 

@@ -356,6 +356,10 @@ busy_timeout_ms = 5000      # SQLite busy_timeout per connection, ms (default 50
 
 All fields are optional; omitting the section uses the defaults. The default is memory-neutral: `4 × 16 MB = 64 MB` per active repo, the same as the previous single connection. Connections open lazily up to `pool_size` and return to the pool when a request finishes; `0` is clamped to a safe value. WAL mode (already used by the index) makes the multiple readers safe alongside the indexing daemon's writes.
 
+### Re-reading `serve.toml` without a restart (v1.1.0)
+
+In federation mode `serve` watches `serve.toml` and `daemon.toml` itself: half a second after a save the repository table is rebuilt as a whole, and a new alias is served without a restart — MCP sessions that are already open see it right away. An edit is applied all or nothing: a parse error, a database that fails to open, or a local alias in `serve.toml` without an entry in `daemon.toml` keeps the previous table. To apply by hand — `POST /reload` (protected by the same allowed-address list); the result of the last attempt is the `config_reload` field of the `health` tool. Changing `[me].ip` or `[pool]` still requires a restart. The daemon also watches `daemon.toml` itself: a new directory starts being indexed and a removed one stops being tracked without a restart — `daemon reload` remains a manual fallback.
+
 ### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
 
 When BSL repos are present in `daemon.toml` (`language = "bsl"`), 12 BSL-specific tools are auto-registered:
