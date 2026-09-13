@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -44,6 +44,7 @@ pub(crate) const LEGACY_OWN_IP: &str = "127.0.0.1";
 /// Для local-репо заполнены `root_path` и `storage` — tool-handler читает
 /// данные из локального SQLite. Для remote — оба поля `None`, `is_local=false`,
 /// и tool-handler форвардит запрос через `RemoteClientPool` по `ip`.
+#[derive(Clone)]
 pub struct RepoEntry {
     /// Канонический путь к корню проекта (только для local).
     pub root_path: Option<PathBuf>,
@@ -403,7 +404,7 @@ pub(crate) const MASS_MODE_PARAMS: &[(&str, &str)] = &[
 #[derive(Clone)]
 pub struct CodeIndexServer {
     /// Карта alias → RepoEntry. BTreeMap для детерминированного порядка в логах и /health.
-    pub repos: Arc<BTreeMap<String, RepoEntry>>,
+    pub repos: Arc<ArcSwap<BTreeMap<String, RepoEntry>>>,
     /// Собственный IP машины (из `serve.toml [me].ip`) — для логов и диагностики.
     pub own_ip: Arc<String>,
     /// Пул HTTP-клиентов к удалённым serve-нодам (lazy init).
@@ -450,6 +451,9 @@ pub struct CodeIndexServer {
     /// Сессионный дедуп ре-доставки строк результата (ключ — mcp-session-id).
     /// Общий на сессии (Arc), состояние внутри ключуется по session_id.
     pub dedup: Arc<SessionDedup>,
+    /// Итог последней попытки перечитать федеративные конфиги. В монорежиме
+    /// и до первой попытки остаётся `None`.
+    pub config_reload: Arc<ArcSwapOption<crate::federation::reload::ReloadResult>>,
 }
 
 impl CodeIndexServer {
@@ -461,7 +465,7 @@ impl CodeIndexServer {
     pub fn with_repos(repos: BTreeMap<String, RepoEntry>) -> Self {
         let active_languages = collect_active_languages(&repos);
         Self {
-            repos: Arc::new(repos),
+            repos: Arc::new(ArcSwap::from_pointee(repos)),
             own_ip: Arc::new(LEGACY_OWN_IP.to_string()),
             clients: Arc::new(RemoteClientPool::with_defaults()),
             tool_router: Self::tool_router(),
@@ -475,6 +479,7 @@ impl CodeIndexServer {
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
             dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -490,7 +495,7 @@ impl CodeIndexServer {
         let active_languages = collect_active_languages(&repos);
         let extension_tools = collect_extension_tools(&active_languages, &registry);
         Self {
-            repos: Arc::new(repos),
+            repos: Arc::new(ArcSwap::from_pointee(repos)),
             own_ip: Arc::new(LEGACY_OWN_IP.to_string()),
             clients: Arc::new(RemoteClientPool::with_defaults()),
             tool_router: Self::tool_router(),
@@ -504,6 +509,7 @@ impl CodeIndexServer {
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
             dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -522,47 +528,21 @@ impl CodeIndexServer {
         local_languages: BTreeMap<String, String>,
         pool_cfg: PoolConfig,
     ) -> anyhow::Result<Self> {
-        let mut map = BTreeMap::new();
-        for repo in repos {
-            let entry = if repo.is_local {
-                let db_path = repo.db_path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Локальный репо '{}' (ip={}) без db_path — баг merge.",
-                        repo.alias,
-                        repo.ip
-                    )
-                })?;
-                let storage = StoragePool::open_file_readonly(db_path, pool_cfg)?;
-                RepoEntry {
-                    root_path: repo.root_path,
-                    storage: Some(storage),
-                    ip: repo.ip,
-                    port: repo.port,
-                    is_local: true,
-                    language: local_languages.get(&repo.alias).cloned(),
-                    processor: None,
-                }
-            } else {
-                RepoEntry {
-                    root_path: None,
-                    storage: None,
-                    ip: repo.ip,
-                    port: repo.port,
-                    is_local: false,
-                    language: None,
-                    processor: None,
-                }
-            };
-            map.insert(repo.alias, entry);
-        }
-        attach_processors(&mut map, registry.as_ref());
+        let map = build_federated_repo_map(
+            repos,
+            registry.as_ref(),
+            &local_languages,
+            pool_cfg,
+            None,
+            false,
+        )?;
         let active_languages = collect_active_languages(&map);
         let extension_tools = match registry.as_ref() {
             Some(reg) => collect_extension_tools(&active_languages, reg),
             None => Vec::new(),
         };
         Ok(Self {
-            repos: Arc::new(map),
+            repos: Arc::new(ArcSwap::from_pointee(map)),
             own_ip: Arc::new(own_ip),
             clients: Arc::new(RemoteClientPool::with_defaults()),
             tool_router: Self::tool_router(),
@@ -576,6 +556,7 @@ impl CodeIndexServer {
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
             dedup: Arc::new(SessionDedup::new(true)),
+            config_reload: Arc::new(ArcSwapOption::empty()),
         })
     }
 
@@ -621,7 +602,7 @@ impl CodeIndexServer {
 
     /// Список алиасов для описаний и диагностики.
     pub fn repo_aliases(&self) -> Vec<String> {
-        self.repos.keys().cloned().collect()
+        self.repos.load().keys().cloned().collect()
     }
 
     /// Builder для опционального whitelist'а MCP-инструментов
@@ -846,8 +827,9 @@ impl CodeIndexServer {
     }
 
     /// Получить RepoEntry по alias или вернуть ToolUnavailable::UnknownRepo JSON.
-    pub(crate) fn resolve_repo(&self, alias: &str) -> Result<&RepoEntry, String> {
-        self.repos.get(alias).ok_or_else(|| {
+    pub(crate) fn resolve_repo(&self, alias: &str) -> Result<RepoEntry, String> {
+        let entry = self.repos.load().get(alias).cloned();
+        entry.ok_or_else(|| {
             tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера.",
@@ -874,7 +856,7 @@ impl CodeIndexServer {
 /// сборке сервера: tool-слой обращается к процессору по каждому вызову
 /// (декларативные привязки), и искать его в реестре каждый раз незачем.
 /// Для remote-репо и репо без языка поле остаётся `None`.
-fn attach_processors(
+pub(crate) fn attach_processors(
     repos: &mut BTreeMap<String, RepoEntry>,
     registry: Option<&ProcessorRegistry>,
 ) {
@@ -889,6 +871,79 @@ fn attach_processors(
             .and_then(|lang| registry.get(lang))
             .cloned();
     }
+}
+
+/// Собрать полный снимок федеративной таблицы. При reload неизменившиеся
+/// локальные записи переиспользуют прежний пул, а для новых путей функция
+/// проверяет корень и при необходимости создаёт только `.code-index/index.db`.
+pub(crate) fn build_federated_repo_map(
+    repos: Vec<FederatedRepo>,
+    registry: Option<&ProcessorRegistry>,
+    local_languages: &BTreeMap<String, String>,
+    pool_cfg: PoolConfig,
+    previous: Option<&BTreeMap<String, RepoEntry>>,
+    create_missing_db: bool,
+) -> anyhow::Result<BTreeMap<String, RepoEntry>> {
+    let mut map = BTreeMap::new();
+    for repo in repos {
+        let alias = repo.alias.clone();
+        let entry = if repo.is_local {
+            let root = repo.root_path.ok_or_else(|| {
+                anyhow::anyhow!("Локальный репо '{}' (ip={}) без root_path — баг merge.", alias, repo.ip)
+            })?;
+            let db_path = repo.db_path.ok_or_else(|| {
+                anyhow::anyhow!("Локальный репо '{}' (ip={}) без db_path — баг merge.", alias, repo.ip)
+            })?;
+            let reused = previous
+                .and_then(|old| old.get(&alias))
+                .filter(|old| old.is_local && old.root_path.as_ref() == Some(&root))
+                .and_then(|old| old.storage.clone());
+            let storage = match reused {
+                Some(storage) => storage,
+                None => {
+                    if create_missing_db {
+                        if !root.is_dir() {
+                            anyhow::bail!(
+                                "Корень локального репо '{}' не существует или не является каталогом: {}",
+                                alias,
+                                root.display()
+                            );
+                        }
+                        if !db_path.exists() {
+                            std::fs::create_dir_all(db_path.parent().ok_or_else(|| {
+                                anyhow::anyhow!("У {} нет родительского каталога", db_path.display())
+                            })?)?;
+                            let storage = Storage::open_file(&db_path)?;
+                            drop(storage);
+                        }
+                    }
+                    StoragePool::open_file_readonly(&db_path, pool_cfg)?
+                }
+            };
+            RepoEntry {
+                root_path: Some(root),
+                storage: Some(storage),
+                ip: repo.ip,
+                port: repo.port,
+                is_local: true,
+                language: local_languages.get(&alias).cloned(),
+                processor: None,
+            }
+        } else {
+            RepoEntry {
+                root_path: None,
+                storage: None,
+                ip: repo.ip,
+                port: repo.port,
+                is_local: false,
+                language: None,
+                processor: None,
+            }
+        };
+        map.insert(alias, entry);
+    }
+    attach_processors(&mut map, registry);
+    Ok(map)
 }
 
 fn collect_active_languages(repos: &BTreeMap<String, RepoEntry>) -> BTreeSet<String> {
@@ -983,7 +1038,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_function", &p,
             ).await;
         }
-        tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await
+        tools::search_function(&entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
     #[tool(description = "Нечёткий FTS-поиск классов/структур по СЛОВАМ (bm25): имя важнее docstring. Выдача БЕЗ тел — только локации (имя/путь/строки/bases). Тело конкретного класса — get_class; локации по ТОЧНОМУ имени — find_symbol. path_glob — фильтр по пути. При 0 совпадений — hint.")]
@@ -994,7 +1049,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_class", &p,
             ).await;
         }
-        tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await
+        tools::search_class(&entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
     #[tool(description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве). МАССОВЫЙ РЕЖИМ ('names'): батчи список ТОЛЬКО когда точно нужны тела ВСЕХ этих функций и результат одной не отменит надобность в остальных (например, правишь их все). Если ОТБИРАЕШЬ, какие из кандидатов релевантны, — НЕ батчи, бери по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в порядке запроса.")]
@@ -1009,7 +1064,7 @@ impl CodeIndexServer {
             // Массовый режим — конкуррентно: каждый элемент берёт своё соединение
             // из пула и исполняется в spawn_blocking (tools::mass_map). Статус
             // папки проверяется один раз на весь батч.
-            if let Some(json) = tools::check_path_status(entry).await {
+            if let Some(json) = tools::check_path_status(&entry).await {
                 return json;
             }
             if names.is_empty() {
@@ -1024,7 +1079,7 @@ impl CodeIndexServer {
             return mass_rows_to_results(rows);
         }
         match p.name {
-            Some(nm) => tools::get_function(entry, nm, p.path_glob).await,
+            Some(nm) => tools::get_function(&entry, nm, p.path_glob).await,
             None => serde_json::json!({
                 "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
             })
@@ -1042,7 +1097,7 @@ impl CodeIndexServer {
         }
         if let Some(names) = p.names {
             // Массовый режим — конкуррентно, зеркало get_function (см. выше).
-            if let Some(json) = tools::check_path_status(entry).await {
+            if let Some(json) = tools::check_path_status(&entry).await {
                 return json;
             }
             if names.is_empty() {
@@ -1057,7 +1112,7 @@ impl CodeIndexServer {
             return mass_rows_to_results(rows);
         }
         match p.name {
-            Some(nm) => tools::get_class(entry, nm, p.path_glob).await,
+            Some(nm) => tools::get_class(&entry, nm, p.path_glob).await,
             None => serde_json::json!({
                 "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
             })
@@ -1073,7 +1128,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callers", &p,
             ).await;
         }
-        tools::get_callers(entry, p.function_name, p.language, p.limit).await
+        tools::get_callers(&entry, p.function_name, p.language, p.limit).await
     }
 
     #[tool(description = "Что вызывает данная функция (callees) — весь список за ОДИН вызов. В каждой записи уже есть caller, callee, line, path файла с вызовом, а для однозначных имён ещё и callee_path/callee_line — место, где вызываемая процедура ОПРЕДЕЛЕНА. Искать каждое вызываемое имя отдельным find_symbol/get_function НЕ нужно; если callee_path нет, значит имя носят несколько процедур — тогда спрашивай их одним grep_code с перечислением через | , а не по вызову на имя. limit — cap (default 200); при обрезке {truncated,total,limit}. Цепочка до конкретной функции — find_path, дерево на несколько уровней — get_call_tree.")]
@@ -1084,7 +1139,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callees", &p,
             ).await;
         }
-        tools::get_callees(entry, p.function_name, p.language, p.limit).await
+        tools::get_callees(&entry, p.function_name, p.language, p.limit).await
     }
 
     #[tool(description = "Цепочка вызовов между двумя функциями за ОДИН вызов. Бери его на вопросы вида «есть ли путь от A до B», «как из A попадают в B», «через что A вызывает B»: кратчайший путь по графу ищет сервер. НЕ восстанавливай цепочку вручную — обход через get_callers/get_callees по одному узлу и чтение тел стоит десятки вызовов и даёт тот же ответ. Параметры: from, to — имена функций; max_depth по умолчанию 5, [1..10]. Универсальный, любой язык. Возвращает {from,to,found,path:[{caller,callee,line}]}. Пути нет — ответ различает «дошли до потолка» и «подграф исчерпан». Для 1С есть отдельный find_path_bsl (учитывает вид вызова).")]
@@ -1095,7 +1150,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "find_path", &p,
             ).await;
         }
-        tools::find_path(entry, p.from, p.to, p.max_depth, p.language).await
+        tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await
     }
 
     #[tool(description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
@@ -1106,7 +1161,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_call_tree", &p,
             ).await;
         }
-        tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
+        tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
     }
 
     #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура). Голым именем зови ТОЛЬКО для уникального имени: если имя — стандартный обработчик объекта/набора записей или просто распространённое, вернутся сотни локаций (truncated) — для таких сразу задавай path_glob (фильтр по пути).")]
@@ -1117,7 +1172,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "find_symbol", &p,
             ).await;
         }
-        tools::find_symbol(entry, p.name, p.language, p.path_glob).await
+        tools::find_symbol(&entry, p.name, p.language, p.path_glob).await
     }
 
     #[tool(description = "Импорты файла (file_id) или модуля (module) в указанном репо. limit — cap (default 200); при обрезке {truncated,total,limit}. Возвращает JSON-массив ImportRecord.")]
@@ -1128,7 +1183,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_imports", &p,
             ).await;
         }
-        tools::get_imports(entry, p.file_id, p.module, p.language, p.limit).await
+        tools::get_imports(&entry, p.file_id, p.module, p.language, p.limit).await
     }
 
     #[tool(description = "Карта/оглавление файла БЕЗ тел функций/классов (безопасно на больших модулях): имена, сигнатуры (args/return_type), диапазоны строк, обрезанные docstring, импорты, переменные + functions_total/classes_total. Тело конкретной функции — get_function(name) или read_file(line_start,line_end). Возвращает JSON-объект.")]
@@ -1139,20 +1194,31 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_file_summary", &p,
             ).await;
         }
-        tools::get_file_summary(entry, p.path).await
+        tools::get_file_summary(&entry, p.path).await
     }
 
     #[tool(description = "Статистика индекса. Если repo указан — для одного репо, иначе — массив по всем подключённым репо.")]
     async fn get_stats(&self, Parameters(p): Parameters<StatsParams>) -> String {
         // Если запрос адресован конкретному remote-репо — форвардим как обычно.
         if let Some(ref alias) = p.repo {
-            if let Some(entry) = self.repos.get(alias) {
-                if !entry.is_local {
-                    return crate::federation::dispatcher::dispatch_remote(
-                        &self.clients, &entry.ip, entry.port, "get_stats", &p,
-                    ).await;
-                }
+            let entry = self.repos.load().get(alias).cloned();
+            let Some(entry) = entry else {
+                return tools::format_unavailable(
+                    crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
+                        message: format!(
+                            "Неизвестный repo '{}'. Доступные: {:?}.",
+                            alias,
+                            self.repo_aliases()
+                        ),
+                    },
+                );
+            };
+            if !entry.is_local {
+                return crate::federation::dispatcher::dispatch_remote(
+                    &self.clients, &entry.ip, entry.port, "get_stats", &p,
+                ).await;
             }
+            return tools::stats_for_entry(self, alias, &entry).await;
         }
         // Без repo — fan-out по всем (включая удалённые) реализуется в этапе 5.
         tools::get_stats(self, p.repo).await
@@ -1166,7 +1232,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_text", &p,
             ).await;
         }
-        tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
+        tools::search_text(&entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
     #[tool(description = "Поиск ТОЛЬКО в телах функций и классов (module-level код — объявления Перем, таблицы инициализации/маршрутизации, константы и строковые литералы ВНЕ процедур — НЕ виден; для поиска по всему файлу бери grep_code). Плюс grep_body в том, что показывает, в какой ИМЕННО функции/классе найден паттерн. pattern — буквальная подстрока без учёта регистра (кириллица тоже; `%` и `_` — обычные символы), regex — регулярное выражение; query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\".")]
@@ -1183,7 +1249,7 @@ impl CodeIndexServer {
             return "{\"error\": \"grep_body: укажите pattern= (подстрока) или regex= (regexp). Для кода вне тел функций — grep_code(regex=…); по xml/md/yaml — grep_text(regex=…).\"}".to_string();
         }
         tools::grep_body(
-            entry, p.pattern, regex, p.language, p.limit, p.path_glob, p.context_lines,
+            &entry, p.pattern, regex, p.language, p.limit, p.path_glob, p.context_lines,
         )
         .await
     }
@@ -1196,7 +1262,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "stat_file", &p,
             ).await;
         }
-        tools::stat_file(entry, p.path).await
+        tools::stat_file(&entry, p.path).await
     }
 
     #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив строк \"<path> | <lang> | <N> lines | <size>\" (mtime — в _meta.file_mtimes). limit — максимум файлов в ответе (default 500); если подходящих файлов больше, ответ несёт {truncated, total, shown, limit}, где total — сколько их всего.")]
@@ -1207,7 +1273,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "list_files", &p,
             ).await;
         }
-        tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await
+        tools::list_files(&entry, p.pattern, p.path_prefix, p.language, p.limit).await
     }
 
     #[tool(description = "Прочитать содержимое файла из индекса. ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ.")]
@@ -1218,7 +1284,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "read_file", &p,
             ).await;
         }
-        tools::read_file(entry, p.path, p.line_start, p.line_end).await
+        tools::read_file(&entry, p.path, p.line_start, p.line_end).await
     }
 
     #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
@@ -1240,7 +1306,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_text", &p,
             ).await;
         }
-        tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        tools::grep_text(&entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
     #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
@@ -1262,7 +1328,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_code", &p,
             ).await;
         }
-        tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        tools::grep_code(&entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
     #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]
@@ -1463,7 +1529,8 @@ impl CodeIndexServer {
             return None;
         }
         let repo = args.get("repo").and_then(|v| v.as_str())?;
-        let entry = self.repos.get(repo)?;
+        let repos = self.repos.load();
+        let entry = repos.get(repo)?;
         if !entry.is_local {
             return None;
         }
@@ -1771,6 +1838,7 @@ impl ServerHandler for CodeIndexServer {
             .find(|t| t.name() == tool_name)
             .ok_or_else(|| ErrorData::invalid_params("tool not found", None))?
             .clone();
+        drop(extension_snapshot);
 
         // Извлечь параметры. У extension-tool `args` — это `serde_json::Value`,
         // который мы передаём в `IndexTool::execute` как есть. Если клиент
@@ -1793,7 +1861,7 @@ impl ServerHandler for CodeIndexServer {
             })?
             .to_string();
 
-        let entry = self.repos.get(&repo).ok_or_else(|| {
+        let entry = self.repos.load().get(&repo).cloned().ok_or_else(|| {
             ErrorData::invalid_params(
                 format!("unknown repo '{}'. Available: {:?}", repo, self.repo_aliases()),
                 None,
@@ -1924,6 +1992,66 @@ fn extension_tool_to_rmcp(t: &dyn IndexTool) -> Tool {
     tool.description = Some(Cow::Owned(t.description().to_string()));
     tool.input_schema = Arc::new(schema_obj);
     tool
+}
+
+// ── Тесты заменяемой таблицы репозиториев ──────────────────────────────────
+
+#[cfg(test)]
+mod repo_snapshot_tests {
+    use super::*;
+
+    fn remote_entry(ip: &str) -> RepoEntry {
+        RepoEntry {
+            root_path: None,
+            storage: None,
+            ip: ip.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: false,
+            language: None,
+            processor: None,
+        }
+    }
+
+    #[test]
+    fn replacement_is_visible_to_existing_server_clone() {
+        let server = CodeIndexServer::with_repos(BTreeMap::from([(
+            "old".to_string(),
+            remote_entry("192.0.2.10"),
+        )]));
+        let existing_session = server.clone();
+
+        server.repos.store(Arc::new(BTreeMap::from([(
+            "new".to_string(),
+            remote_entry("192.0.2.20"),
+        )])));
+
+        assert_eq!(existing_session.repo_aliases(), vec!["new".to_string()]);
+        let entry = existing_session
+            .resolve_repo("new")
+            .expect("новый alias должен быть виден существующему клону");
+        assert_eq!(entry.ip, "192.0.2.20");
+        assert!(existing_session.resolve_repo("old").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_entry_survives_removal_from_table() {
+        let root = PathBuf::from("C:/repo-before-swap");
+        let storage = Storage::open_in_memory().expect("тестовая БД");
+        let server = CodeIndexServer::with_storage("kept", root.clone(), storage);
+        let entry = server
+            .resolve_repo("kept")
+            .expect("запись должна разрешиться до подмены");
+
+        server.repos.store(Arc::new(BTreeMap::new()));
+
+        assert_eq!(entry.local_root(), root.as_path());
+        assert!(entry.storage.is_some());
+        entry
+            .storage_pool()
+            .get()
+            .await
+            .expect("пул из принадлежащей копии должен оставаться жив");
+    }
 }
 
 // ── Тесты массового режима ([mcp].mass_mode_tools, v0.28.0) ────────────────

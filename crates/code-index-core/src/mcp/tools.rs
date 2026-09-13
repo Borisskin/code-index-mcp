@@ -1643,11 +1643,20 @@ pub async fn one_stats(
     }
 }
 
+pub(crate) async fn stats_for_entry(
+    server: &CodeIndexServer,
+    alias: &str,
+    entry: &RepoEntry,
+) -> String {
+    to_json(&one_stats(server, alias, entry).await)
+}
+
 /// Полная сводка: для одного `repo` или fan-out по всем подключённым.
 pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String {
     if let Some(alias) = repo {
-        return match server.repos.get(&alias) {
-            Some(entry) => to_json(&one_stats(server, &alias, entry).await),
+        let entry = server.repos.load().get(&alias).cloned();
+        return match entry {
+            Some(entry) => stats_for_entry(server, &alias, &entry).await,
             None => format_unavailable(ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные: {:?}.",
@@ -1660,14 +1669,16 @@ pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String
 
     // Fan-out по всем репо. Параллельно через JoinSet, удалённые с таймаутом 5с.
     let mut set = tokio::task::JoinSet::new();
-    for alias in server.repos.keys().cloned().collect::<Vec<_>>() {
+    let repos: Vec<_> = server
+        .repos
+        .load()
+        .iter()
+        .map(|(alias, entry)| (alias.clone(), entry.clone()))
+        .collect();
+    for (alias, entry) in repos {
         let server_clone = server.clone();
         set.spawn(async move {
-            let entry = server_clone
-                .repos
-                .get(&alias)
-                .expect("alias только что взят из repos.keys()");
-            one_stats(&server_clone, &alias, entry).await
+            one_stats(&server_clone, &alias, &entry).await
         });
     }
 
@@ -2123,11 +2134,22 @@ fn annotate_unreadable(payload: &mut serde_json::Value, unreadable: usize) {
 /// Живость MCP + демон по каждому репо.
 pub async fn health(server: &CodeIndexServer) -> String {
     let daemon_info = client::runtime_info();
+    let config_reload = server
+        .config_reload
+        .load_full()
+        .map(|result| serde_json::to_value(result.as_ref()).unwrap_or(serde_json::Value::Null));
+    let repo_entries: Vec<_> = server
+        .repos
+        .load()
+        .iter()
+        .map(|(alias, entry)| (alias.clone(), entry.clone()))
+        .collect();
+    let repo_aliases: Vec<_> = repo_entries.iter().map(|(alias, _)| alias.clone()).collect();
 
     // Сводка по репо: для local — статус пути у демона; для remote —
     // короткая запись без HTTP-ping (ping вне rc6).
     let mut repos = Vec::new();
-    for (alias, entry) in server.repos.iter() {
+    for (alias, entry) in repo_entries {
         if !entry.is_local {
             repos.push(serde_json::json!({
                 "repo": alias,
@@ -2160,10 +2182,11 @@ pub async fn health(server: &CodeIndexServer) -> String {
         "mcp": {
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
-            "repos": server.repo_aliases(),
+            "repos": repo_aliases,
         },
         "daemon": daemon_health,
         "repos": repos,
+        "config_reload": config_reload,
     });
     to_json(&obj)
 }

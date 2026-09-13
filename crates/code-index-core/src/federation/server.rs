@@ -77,11 +77,11 @@ fn ok_json(body: String) -> axum::response::Response {
 /// Найти RepoEntry с гарантией is_local=true. Если репо нет / он remote —
 /// возвращаем federation-error JSON со статусом 200 (не 4xx, чтобы вызывающая
 /// сторона могла прочитать тело и решить).
-fn resolve_local<'a>(
-    server: &'a CodeIndexServer,
+fn resolve_local(
+    server: &CodeIndexServer,
     repo: &str,
     tool: &str,
-) -> Result<&'a RepoEntry, axum::response::Response> {
+) -> Result<RepoEntry, axum::response::Response> {
     let entry = match server.resolve_repo(repo) {
         Ok(e) => e,
         Err(j) => return Err(ok_json(j)),
@@ -110,7 +110,7 @@ async fn handle_search_function(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await)
+    ok_json(tools::search_function(&entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_search_class(
@@ -121,7 +121,7 @@ async fn handle_search_class(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await)
+    ok_json(tools::search_class(&entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_get_function(
@@ -132,7 +132,7 @@ async fn handle_get_function(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_function(entry, p.name, p.path_glob).await)
+    ok_json(tools::get_function(&entry, p.name, p.path_glob).await)
 }
 
 async fn handle_get_class(
@@ -143,7 +143,7 @@ async fn handle_get_class(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_class(entry, p.name, p.path_glob).await)
+    ok_json(tools::get_class(&entry, p.name, p.path_glob).await)
 }
 
 async fn handle_get_callers(
@@ -154,7 +154,7 @@ async fn handle_get_callers(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callers(entry, p.function_name, p.language, p.limit).await)
+    ok_json(tools::get_callers(&entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_get_callees(
@@ -165,7 +165,7 @@ async fn handle_get_callees(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callees(entry, p.function_name, p.language, p.limit).await)
+    ok_json(tools::get_callees(&entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_find_path(
@@ -176,7 +176,7 @@ async fn handle_find_path(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::find_path(entry, p.from, p.to, p.max_depth, p.language).await)
+    ok_json(tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await)
 }
 
 async fn handle_get_call_tree(
@@ -187,7 +187,7 @@ async fn handle_get_call_tree(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await)
+    ok_json(tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await)
 }
 
 async fn handle_find_symbol(
@@ -198,7 +198,7 @@ async fn handle_find_symbol(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::find_symbol(entry, p.name, p.language, p.path_glob).await)
+    ok_json(tools::find_symbol(&entry, p.name, p.language, p.path_glob).await)
 }
 
 async fn handle_get_imports(
@@ -209,7 +209,7 @@ async fn handle_get_imports(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_imports(entry, p.file_id, p.module, p.language, p.limit).await)
+    ok_json(tools::get_imports(&entry, p.file_id, p.module, p.language, p.limit).await)
 }
 
 async fn handle_get_file_summary(
@@ -220,7 +220,7 @@ async fn handle_get_file_summary(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_file_summary(entry, p.path).await)
+    ok_json(tools::get_file_summary(&entry, p.path).await)
 }
 
 async fn handle_get_stats(
@@ -232,7 +232,8 @@ async fn handle_get_stats(
     // repo=None — приёмник честно отдаёт сводку (только по своим, без
     // рекурсивного fan-out — это исключает круг между нодами).
     if let Some(ref alias) = p.repo {
-        if let Some(entry) = server.repos.get(alias) {
+        let entry = server.repos.load().get(alias).cloned();
+        if let Some(entry) = entry {
             if !entry.is_local {
                 return ok_json(federation_error(
                     "get_stats",
@@ -245,7 +246,7 @@ async fn handle_get_stats(
                 ));
             }
             // local — `tools::get_stats` сразу пойдёт по local-ветке.
-            return ok_json(tools::get_stats(&server, Some(alias.clone())).await);
+            return ok_json(tools::stats_for_entry(&server, alias, &entry).await);
         }
         return ok_json(crate::mcp::tools::format_unavailable(
             crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
@@ -261,11 +262,15 @@ async fn handle_get_stats(
     // чтобы не создавать круг (forwarded → forwarded). Делаем это
     // «вручную» через короткий цикл по local-репо.
     let mut all = Vec::new();
-    for (alias, entry) in server.repos.iter() {
-        if !entry.is_local {
-            continue;
-        }
-        let body = tools::get_stats(&server, Some(alias.clone())).await;
+    let local_repos: Vec<_> = server
+        .repos
+        .load()
+        .iter()
+        .filter(|(_, entry)| entry.is_local)
+        .map(|(alias, entry)| (alias.clone(), entry.clone()))
+        .collect();
+    for (alias, entry) in local_repos {
+        let body = tools::stats_for_entry(&server, &alias, &entry).await;
         // body — это уже JSON-string одной записи, парсим обратно в Value.
         match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(v) => all.push(v),
@@ -284,7 +289,7 @@ async fn handle_search_text(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await)
+    ok_json(tools::search_text(&entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_grep_body(
@@ -299,7 +304,7 @@ async fn handle_grep_body(
     let regex = p.regex.clone().or_else(|| p.query.clone());
     ok_json(
         tools::grep_body(
-            entry,
+            &entry,
             p.pattern,
             regex,
             p.language,
@@ -321,7 +326,7 @@ async fn handle_stat_file(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::stat_file(entry, p.path).await)
+    ok_json(tools::stat_file(&entry, p.path).await)
 }
 
 async fn handle_list_files(
@@ -332,7 +337,7 @@ async fn handle_list_files(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await)
+    ok_json(tools::list_files(&entry, p.pattern, p.path_prefix, p.language, p.limit).await)
 }
 
 async fn handle_read_file(
@@ -343,7 +348,7 @@ async fn handle_read_file(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::read_file(entry, p.path, p.line_start, p.line_end).await)
+    ok_json(tools::read_file(&entry, p.path, p.line_start, p.line_end).await)
 }
 
 async fn handle_grep_text(
@@ -367,7 +372,7 @@ async fn handle_grep_text(
     };
     ok_json(
         tools::grep_text(
-            entry,
+            &entry,
             regex,
             p.path_glob,
             p.language,
@@ -399,7 +404,7 @@ async fn handle_grep_code(
     };
     ok_json(
         tools::grep_code(
-            entry,
+            &entry,
             regex,
             p.path_glob,
             p.language,
@@ -458,6 +463,7 @@ async fn handle_extension_tool(
             ));
         }
     };
+    drop(snapshot);
 
     let storage = entry.storage_pool();
     let root_path: Option<&std::path::Path> = entry.root_path.as_deref();

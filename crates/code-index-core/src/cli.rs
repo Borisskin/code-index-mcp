@@ -415,7 +415,10 @@ async fn serve_http(
     host: &str,
     port: u16,
     federate_router: Option<axum::Router>,
-    whitelist: Option<std::sync::Arc<std::collections::HashSet<std::net::IpAddr>>>,
+    whitelist: Option<
+        std::sync::Arc<arc_swap::ArcSwap<std::collections::HashSet<std::net::IpAddr>>>,
+    >,
+    config_reloader: Option<crate::federation::reload::ServeConfigReloader>,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -446,8 +449,14 @@ async fn serve_http(
     if let Some(fr) = federate_router {
         app = app.merge(fr);
     }
+    if let Some(reloader) = config_reloader {
+        let reload_routes = axum::Router::new()
+            .route("/reload", axum::routing::post(reload_config_route))
+            .with_state(reloader);
+        app = app.merge(reload_routes);
+    }
     if let Some(allowed) = whitelist {
-        let count = allowed.len();
+        let count = allowed.load().len();
         app = app.layer(axum::middleware::from_fn_with_state(
             allowed,
             crate::federation::whitelist::middleware,
@@ -470,6 +479,14 @@ async fn serve_http(
     .await
     .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
     Ok(())
+}
+
+async fn reload_config_route(
+    axum::extract::State(reloader): axum::extract::State<
+        crate::federation::reload::ServeConfigReloader,
+    >,
+) -> axum::Json<crate::federation::reload::ReloadResult> {
+    axum::Json(reloader.reload().await)
 }
 
 /// `GET /cache-stats` — наблюдаемость кэша serve (для смоука и /health-обвязки):
@@ -802,6 +819,10 @@ async fn cmd_serve(
             serve_cfg_path.display()
         );
         let serve_cfg = federation::config::load_from(&serve_cfg_path)?;
+        let daemon_cfg_path = match config.as_deref() {
+            Some(path) => path.to_path_buf(),
+            None => crate::daemon_core::paths::config_path()?,
+        };
         let daemon_cfg = match config.as_deref() {
             Some(p) => crate::daemon_core::config::load_from(p)?,
             None => crate::daemon_core::config::load_or_default()?,
@@ -871,7 +892,17 @@ async fn cmd_serve(
         crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
         crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
         let federate_router = federation::server::federate_router(server.clone());
-        let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
+        let allowed = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            federation::whitelist::build(&serve_cfg),
+        ));
+        let config_reloader = federation::reload::ServeConfigReloader::new(
+            server.clone(),
+            allowed.clone(),
+            serve_cfg_path.clone(),
+            daemon_cfg_path.clone(),
+            serve_cfg.me.ip.clone(),
+            serve_cfg.pool.resolve(),
+        )?;
 
         // Языки из daemon.toml применяем ДО старта транспорта: клиент,
         // спросивший перечень инструментов первым же запросом, обязан
@@ -888,24 +919,23 @@ async fn cmd_serve(
             }
         }
 
-        // File-watch на daemon.toml — реактивно подменяем
-        // active_languages при правке (этап 1.7). config может быть
-        // не задан — тогда watcher не запускаем (active set
-        // задаётся только содержимым serve.toml, который тут не
-        // меняется).
-        let _config_watch = if let Some(cfg_path) = config.as_deref() {
-            Some(crate::mcp::config_watch::spawn_watch(
-                server.clone(),
-                cfg_path.to_path_buf(),
-            ))
-        } else {
-            None
-        };
+        // Один watcher следит за согласованной парой файлов. Он запускается
+        // всегда, в том числе при использовании default daemon.toml.
+        let _config_watch = crate::mcp::config_watch::spawn_federated_watch(
+            config_reloader.clone(),
+        );
 
         // Bind: --host имеет приоритет, иначе [me].ip.
         let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
-        serve_http(server, &bind_host, port, Some(federate_router), Some(allowed))
-            .await?;
+        serve_http(
+            server,
+            &bind_host,
+            port,
+            Some(federate_router),
+            Some(allowed.clone()),
+            Some(config_reloader),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1022,7 +1052,7 @@ async fn cmd_serve(
                 .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
         }
         "http" => {
-            serve_http(server, &bind_host, port, None, None).await?;
+            serve_http(server, &bind_host, port, None, None, None).await?;
         }
         other => {
             return Err(anyhow::anyhow!(

@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 use super::CodeIndexServer;
 use crate::daemon_core::config;
+use crate::federation::reload::{absolute_path, ServeConfigReloader};
 
 /// Запускает background task, отслеживающий изменения `daemon.toml`.
 /// Возвращает `JoinHandle`, по которому caller может дождаться завершения
@@ -51,6 +52,7 @@ pub fn spawn_watch(
 /// Внутренний event-loop. Вынесен отдельной функцией, чтобы `?` ловило
 /// ошибки в одном месте и task мог их залогировать.
 async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result<()> {
+    let daemon_toml_path = absolute_path(&daemon_toml_path)?;
     if !daemon_toml_path.exists() {
         tracing::warn!(
             "config_watch: {} не существует на момент старта watcher'а; \
@@ -63,7 +65,7 @@ async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result
     // (mpsc), debouncer пишет в него из своего thread-pool, наш async-task
     // читает через `recv().await`.
     let (tx, mut rx) = mpsc::channel::<DebounceEventResult>(16);
-    let _debouncer = build_debouncer(&daemon_toml_path, tx)?;
+    let _debouncer = build_debouncer(vec![daemon_toml_path.clone()], tx)?;
 
     tracing::info!(
         "config_watch: отслеживаю изменения {} (debounce 500мс)",
@@ -104,11 +106,49 @@ async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result
     Ok(())
 }
 
+/// Запустить единый watcher пары федеративных конфигов.
+pub fn spawn_federated_watch(reloader: ServeConfigReloader) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = run_federated_watch(reloader).await {
+            tracing::error!("config_watch федерации завершился с ошибкой: {}", e);
+        }
+    })
+}
+
+async fn run_federated_watch(reloader: ServeConfigReloader) -> Result<()> {
+    let targets = vec![
+        reloader.serve_path().to_path_buf(),
+        reloader.daemon_path().to_path_buf(),
+    ];
+    let (tx, mut rx) = mpsc::channel::<DebounceEventResult>(16);
+    let _debouncer = build_debouncer(targets.clone(), tx)?;
+    tracing::info!(
+        "config_watch: отслеживаю изменения {} и {} (debounce 500мс)",
+        targets[0].display(),
+        targets[1].display()
+    );
+    while let Some(event) = rx.recv().await {
+        match event {
+            Ok(events) if !events.is_empty() => {
+                reloader.reload().await;
+            }
+            Ok(_) => {}
+            Err(errors) => {
+                for err in errors {
+                    tracing::warn!("config_watch: notify error: {}", err);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Событие достойно перечитывания конфига? Да — только если это правка
 /// самого `daemon.toml`, а не события по соседним файлам каталога и не
 /// событие доступа (открытие/закрытие на чтение).
-fn is_config_change(kind: &EventKind, paths: &[PathBuf], target: &Path) -> bool {
-    !matches!(kind, EventKind::Access(_)) && paths.iter().any(|p| p == target)
+fn is_config_change(kind: &EventKind, paths: &[PathBuf], targets: &[PathBuf]) -> bool {
+    !matches!(kind, EventKind::Access(_))
+        && paths.iter().any(|path| targets.iter().any(|target| path == target))
 }
 
 /// Собрать `Debouncer` и подписать его на родительскую директорию
@@ -116,19 +156,20 @@ fn is_config_change(kind: &EventKind, paths: &[PathBuf], target: &Path) -> bool 
 /// что atomic-rename редактора (написать в .tmp → rename) удаляет
 /// inode исходного файла и watch на нём перестаёт срабатывать.
 fn build_debouncer(
-    daemon_toml_path: &Path,
+    targets: Vec<PathBuf>,
     tx: mpsc::Sender<DebounceEventResult>,
 ) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
-    let parent = daemon_toml_path
-        .parent()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "config_watch: у пути {} нет parent — не на что подписываться",
-                daemon_toml_path.display()
-            )
-        })?
-        .to_path_buf();
-    let target = daemon_toml_path.to_path_buf();
+    let parents: BTreeSet<PathBuf> = targets
+        .iter()
+        .map(|target| {
+            target.parent().map(Path::to_path_buf).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config_watch: у пути {} нет parent — не на что подписываться",
+                    target.display()
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(500),
@@ -148,7 +189,7 @@ fn build_debouncer(
             let filtered: DebounceEventResult = match res {
                 Ok(events) => Ok(events
                     .into_iter()
-                    .filter(|e| is_config_change(&e.kind, &e.paths, &target))
+                    .filter(|e| is_config_change(&e.kind, &e.paths, &targets))
                     .collect()),
                 Err(errors) => Err(errors),
             };
@@ -158,9 +199,11 @@ fn build_debouncer(
         },
     )?;
 
-    debouncer
-        .watch(parent.as_path(), RecursiveMode::NonRecursive)
-        .map_err(|e| anyhow::anyhow!("config_watch: не удалось watch '{}': {}", parent.display(), e))?;
+    for parent in parents {
+        debouncer
+            .watch(parent.as_path(), RecursiveMode::NonRecursive)
+            .map_err(|e| anyhow::anyhow!("config_watch: не удалось watch '{}': {}", parent.display(), e))?;
+    }
     Ok(debouncer)
 }
 
@@ -190,6 +233,20 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
     }
     let cfg = config::load_from(daemon_toml_path)?;
 
+    let active = active_languages(&cfg);
+
+    tracing::info!(
+        "config_watch: перечитан {}, активные языки: {:?}",
+        daemon_toml_path.display(),
+        active.iter().collect::<Vec<_>>()
+    );
+    server.reload_extensions(active).await;
+    Ok(())
+}
+
+/// Собрать множество активных языков тем же способом для mono-watch и
+/// федеративного перечитывателя.
+pub(crate) fn active_languages(cfg: &config::DaemonFileConfig) -> BTreeSet<String> {
     // Собираем множество активных языков. У записи без `language` язык
     // определяем сами — тем же способом, каким его заполняет демон при
     // старте. Раньше такие записи просто пропускались, и получалось так:
@@ -219,13 +276,7 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
         }
     }
 
-    tracing::info!(
-        "config_watch: перечитан {}, активные языки: {:?}",
-        daemon_toml_path.display(),
-        active.iter().collect::<Vec<_>>()
-    );
-    server.reload_extensions(active).await;
-    Ok(())
+    active
 }
 
 #[cfg(test)]
@@ -341,29 +392,52 @@ mod tests {
         assert!(!is_config_change(
             &EventKind::Access(AccessKind::Open(AccessMode::Read)),
             &paths,
-            &target
+            std::slice::from_ref(&target)
         ));
         assert!(!is_config_change(
             &EventKind::Access(AccessKind::Close(AccessMode::Read)),
             &paths,
-            &target
+            std::slice::from_ref(&target)
         ));
         // Реальная правка — по-прежнему повод перечитать.
         assert!(is_config_change(
             &EventKind::Modify(ModifyKind::Any),
             &paths,
-            &target
+            std::slice::from_ref(&target)
         ));
         assert!(is_config_change(
             &EventKind::Create(CreateKind::File),
             &paths,
-            &target
+            std::slice::from_ref(&target)
         ));
         // Событие по соседнему файлу каталога — не наше дело.
         assert!(!is_config_change(
             &EventKind::Modify(ModifyKind::Any),
             &[PathBuf::from("/cfg/daemon.json")],
-            &target
+            std::slice::from_ref(&target)
+        ));
+    }
+
+    #[test]
+    fn federated_filter_accepts_both_targets_only() {
+        use notify_debouncer_full::notify::event::{AccessKind, AccessMode, ModifyKind};
+
+        let serve = PathBuf::from("/cfg/serve.toml");
+        let daemon = PathBuf::from("/cfg/daemon.toml");
+        let targets = vec![serve.clone(), daemon.clone()];
+        let modified = EventKind::Modify(ModifyKind::Any);
+
+        assert!(is_config_change(&modified, &[serve], &targets));
+        assert!(is_config_change(&modified, &[daemon], &targets));
+        assert!(!is_config_change(
+            &modified,
+            &[PathBuf::from("/cfg/neighbor.toml")],
+            &targets
+        ));
+        assert!(!is_config_change(
+            &EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            &[targets[0].clone()],
+            &targets
         ));
     }
 

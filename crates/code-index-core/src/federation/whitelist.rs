@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
@@ -42,7 +43,7 @@ pub fn build(cfg: &ServeFileConfig) -> HashSet<IpAddr> {
 /// `axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())`,
 /// иначе ConnectInfo не извлечётся.
 pub async fn middleware(
-    State(allowed): State<Arc<HashSet<IpAddr>>>,
+    State(allowed): State<Arc<ArcSwap<HashSet<IpAddr>>>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
@@ -55,7 +56,8 @@ pub async fn middleware(
             peer = IpAddr::V4(v4);
         }
     }
-    if !allowed.contains(&peer) {
+    let is_allowed = allowed.load().contains(&peer);
+    if !is_allowed {
         let body = serde_json::json!({
             "error": "forbidden",
             "peer": peer.to_string(),
@@ -73,7 +75,9 @@ pub async fn middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, routing::get, Router};
     use crate::federation::config::{MeSection, ServePathEntry};
+    use tower::ServiceExt;
 
     #[test]
     fn build_includes_loopback_and_me_and_paths() {
@@ -108,5 +112,37 @@ mod tests {
         let set = build(&cfg);
         // Только loopback + me.ip (paths[0] не парсится — пропущена).
         assert_eq!(set.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn store_changes_decision_for_next_request() {
+        let first_peer = "192.0.2.10".parse::<IpAddr>().unwrap();
+        let second_peer = "192.0.2.20".parse::<IpAddr>().unwrap();
+        let allowed = Arc::new(ArcSwap::from_pointee(HashSet::from([first_peer])));
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                allowed.clone(),
+                middleware,
+            ));
+
+        let request_from = |peer| {
+            let mut request = Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(peer, 12345)));
+            request
+        };
+
+        let before = app.clone().oneshot(request_from(first_peer)).await.unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+
+        allowed.store(Arc::new(HashSet::from([second_peer])));
+
+        let after = app.oneshot(request_from(first_peer)).await.unwrap();
+        assert_eq!(after.status(), StatusCode::FORBIDDEN);
     }
 }
