@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.8.6] — 2026-10-08
+
+**`serve` over HTTP admits clients by network address: `/mcp` no longer rejects a foreign `Host`.**
+
+### Fixed
+
+- **A `serve` node listening on a network address rejected every external MCP client.** The `/mcp` route is protected against DNS rebinding: rmcp admits only the `Host` values listed in its configuration, and that list defaults to loopback only (`localhost`, `127.0.0.1`, `::1`). `serve_http` passed the default configuration and there was no way to extend the list: a client connecting by the server's address (`--host 0.0.0.0` or `[me].ip` in `serve.toml`) got `403 Forbidden: Host header is not allowed`, with `rejected request with disallowed Host header (possible DNS rebinding attempt)` in the log. The federation layout hid this: inter-node traffic goes over `/federate/*`, which does not pass through rmcp, and MCP clients connected to `127.0.0.1`. Now the defaults are extended with the bind address (`--host` or `[me].ip`, except `0.0.0.0` and `::`), the `[me].allowed_hosts` list from `serve.toml`, and the `CODE_INDEX_ALLOWED_HOSTS` environment variable (the same values, comma-separated; it also works in single-repository mode, where `serve.toml` is not read). The check is never disabled: a value neither listed nor among the defaults still gets `403`.
+
+### Compatibility
+
+- A `serve.toml` without `[me].allowed_hosts` parses as before; where clients connect over loopback, behaviour is unchanged.
+- The list is assembled at service startup: editing `[me].allowed_hosts` or the environment variable is applied by restarting `serve` — as with `[me].ip` and `[pool]`.
+
+### Verification
+
+- **A locally built release `bsl-indexer` 1.8.6 against the same index and database as the live serve; for contrast, the same node and the same registry on the 1.8.5 release asset.** Before the fix: a `Host` header carrying the node's address — `403 Forbidden: Host header is not allowed`, with `rejected request with disallowed Host header` in the log; a name added to the list was rejected the same way. After the fix: the node's address — 200 and a correct `initialize`, a name from `[me].allowed_hosts` — 200, an unlisted name — 403 with the same log line, `127.0.0.1` — 200. The bind address is added automatically: a node listening on a network address with a registry **without** `[me].allowed_hosts` accepts that address in the header (with and without the port) — 200, while an unlisted name gets 403; the list in the log starts with the loopback defaults and contains the node's address. The environment variable was verified in single-repository mode (`--path`, no `serve.toml`): a name from `CODE_INDEX_ALLOWED_HOSTS` — 200, an unlisted one — 403, without the variable — 403. Network-address probes went directly, bypassing the test stand's proxy.
+- **Service routes are unaffected:** `/federate/get_stats` and `/cache-stats` answered 200 with a foreign `Host` before the fix too — they do not pass through rmcp's check; behaviour is preserved.
+- **Tests:** `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings` — clean; `cargo test --workspace --all-targets` — 0 failed. 5 new: the composition of the `Host` list (wildcard addresses, the bind address, config without duplicates, environment string parsing) and parsing of `[me].allowed_hosts` in `serve.toml` along with backward compatibility.
+- **Federation node (Linux, containers):** before the update a request to `/mcp` by the node's network address returned 403, after it — 200 with a correct handshake; an unlisted name still gets 403, and federation over `/federate/*` works. A real MCP client (the official SDK) completes a full session over the network: handshake, tool list, and two calls returning real data from the node. A client from an address outside the allowed list gets `{"error":"forbidden","peer":"..."}` — the second, independent protection layer.
+
 ## [1.8.5] — 2026-09-27
 
 **The release's Linux archives run on glibc 2.17 and newer — including Ubuntu 22.04.**
