@@ -109,6 +109,7 @@ mod tests {
             me: MeSection {
                 ip: me_ip.to_string(),
                 token: None,
+                allowed_hosts: Vec::new(),
             },
             paths: paths
                 .into_iter()
@@ -128,6 +129,7 @@ mod tests {
             me: MeSection {
                 ip: me_ip.to_string(),
                 token: None,
+                allowed_hosts: Vec::new(),
             },
             paths: paths
                 .into_iter()

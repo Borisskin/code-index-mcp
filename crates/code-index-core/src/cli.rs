@@ -50,6 +50,12 @@ enum Commands {
 
         /// HTTP: адрес биндинга. Если не задан и есть `serve.toml` —
         /// берётся `[me].ip`. Иначе по умолчанию `127.0.0.1`.
+        ///
+        /// Этот адрес автоматически разрешается как значение заголовка
+        /// `Host` для роута `/mcp` (защита rmcp от DNS-rebinding пропускает
+        /// иначе только loopback). Прочие имена клиентов перечисляются в
+        /// `[me].allowed_hosts` (serve.toml) или в `CODE_INDEX_ALLOWED_HOSTS`
+        /// через запятую; при `--host 0.0.0.0` — только так.
         #[arg(long)]
         host: Option<String>,
 
@@ -420,6 +426,63 @@ fn mono_repo_language(
     }
 }
 
+/// Переменная окружения с дополнительными значениями заголовка `Host` для
+/// роута `/mcp` (через запятую). Действует в обоих режимах serve — и в
+/// федеративном, и в моно.
+const ENV_ALLOWED_HOSTS: &str = "CODE_INDEX_ALLOWED_HOSTS";
+
+/// Разобрать список хостов из строки: через запятую, с обрезкой пробелов;
+/// пустые элементы отбрасываются, порядок сохраняется.
+fn parse_allowed_hosts_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Дополнительные хосты из `CODE_INDEX_ALLOWED_HOSTS`. Переменная не задана
+/// или пуста → пустой список (поведение не меняется).
+fn env_allowed_hosts() -> Vec<String> {
+    std::env::var(ENV_ALLOWED_HOSTS)
+        .map(|raw| parse_allowed_hosts_list(&raw))
+        .unwrap_or_default()
+}
+
+/// Запись для адреса привязки. Слушающий узел обязан принимать собственный
+/// адрес: иначе LAN-клиент получает `403` от проверки Host внутри rmcp.
+/// Дикие адреса (`0.0.0.0`, `::`) значением заголовка `Host` не бывают —
+/// для них адреса перечисляет оператор.
+fn bind_host_allowed_entry(bind_host: &str) -> Option<String> {
+    let host = bind_host.trim();
+    if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// Полный список значений заголовка `Host`, которые принимает `/mcp`:
+/// адрес привязки, затем перечисленное в `serve.toml` и в окружении.
+/// Повторы (без учёта регистра) схлопываются.
+///
+/// Пустой результат НЕ означает «разрешить всё»: rmcp остаётся на своих
+/// дефолтах (`localhost`, `127.0.0.1`, `::1`) — защита от DNS-rebinding
+/// не отключается ни этим списком, ни его отсутствием.
+fn resolve_allowed_hosts(bind_host: &str, configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(entry) = bind_host_allowed_entry(bind_host) {
+        out.push(entry);
+    }
+    for raw in configured {
+        let entry = raw.trim();
+        if entry.is_empty() || out.iter().any(|h| h.eq_ignore_ascii_case(entry)) {
+            continue;
+        }
+        out.push(entry.to_string());
+    }
+    out
+}
+
 /// Запуск MCP-сервера по HTTP (Streamable HTTP) на `host:port`.
 ///
 /// Роут `/mcp` — точка подключения MCP-клиента (url из `.mcp.json`).
@@ -428,10 +491,15 @@ fn mono_repo_language(
 /// `LocalSessionManager` держит сессии in-memory. На каждую сессию фабрика
 /// клонирует уже собранный `CodeIndexServer` (он реализует `Clone`), так что
 /// все сессии разделяют общий набор открытых SQLite-баз.
+///
+/// `allowed_hosts` дополняет дефолтный список rmcp: без него узел,
+/// слушающий LAN-адрес, отклонял любого внешнего клиента (`403 Forbidden:
+/// Host header is not allowed`). Список собирает `resolve_allowed_hosts`.
 async fn serve_http(
     server: crate::mcp::CodeIndexServer,
     host: &str,
     port: u16,
+    allowed_hosts: Vec<String>,
     federate_router: Option<axum::Router>,
     whitelist: Option<
         std::sync::Arc<arc_swap::ArcSwap<std::collections::HashSet<std::net::IpAddr>>>,
@@ -446,11 +514,19 @@ async fn serve_http(
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let svc_server = server.clone();
-    let http_service = StreamableHttpService::new(
-        move || Ok(svc_server.clone()),
-        session_manager,
-        StreamableHttpServerConfig::default(),
-    );
+    let mut http_config = StreamableHttpServerConfig::default();
+    for entry in &allowed_hosts {
+        if !http_config
+            .allowed_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(entry))
+        {
+            http_config.allowed_hosts.push(entry.clone());
+        }
+    }
+    tracing::info!("MCP /mcp принимает Host: {:?}", http_config.allowed_hosts);
+    let http_service =
+        StreamableHttpService::new(move || Ok(svc_server.clone()), session_manager, http_config);
 
     let mut app = axum::Router::new().nest_service("/mcp", http_service);
     // Роуты per-file свежести кэша serve (сигналы от демона при переиндексации):
@@ -1011,10 +1087,17 @@ async fn cmd_serve(
 
         // Bind: --host имеет приоритет, иначе [me].ip.
         let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
+        // Значения Host для /mcp: адрес привязки + [me].allowed_hosts + env.
+        // Список зашивается в rmcp-сервис на старте — правка конфига
+        // подхватывается перезапуском serve, не горячей перезагрузкой.
+        let mut configured_hosts = serve_cfg.me.allowed_hosts.clone();
+        configured_hosts.extend(env_allowed_hosts());
+        let allowed_hosts = resolve_allowed_hosts(&bind_host, &configured_hosts);
         serve_http(
             server,
             &bind_host,
             port,
+            allowed_hosts,
             Some(federate_router),
             Some(allowed.clone()),
             Some(config_reloader),
@@ -1141,7 +1224,10 @@ async fn cmd_serve(
                 .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
         }
         "http" => {
-            serve_http(server, &bind_host, port, None, None, None).await?;
+            // Моно-режим: serve.toml не читается, поэтому к адресу привязки
+            // добавляется только `CODE_INDEX_ALLOWED_HOSTS`.
+            let allowed_hosts = resolve_allowed_hosts(&bind_host, &env_allowed_hosts());
+            serve_http(server, &bind_host, port, allowed_hosts, None, None, None).await?;
         }
         other => {
             return Err(anyhow::anyhow!(
@@ -1781,5 +1867,56 @@ mod mono_language_tests {
 
         let empty = std::collections::BTreeMap::new();
         assert_eq!(mono_repo_language("a", &root, Some(&empty)), None);
+    }
+}
+
+#[cfg(test)]
+mod allowed_hosts_tests {
+    use super::*;
+
+    /// Дикие адреса и пустая строка не становятся значением заголовка Host:
+    /// после них список остаётся пустым, то есть rmcp работает на дефолтах.
+    #[test]
+    fn дикие_адреса_ничего_не_добавляют() {
+        assert!(resolve_allowed_hosts("0.0.0.0", &[]).is_empty());
+        assert!(resolve_allowed_hosts("::", &[]).is_empty());
+        assert!(resolve_allowed_hosts("", &[]).is_empty());
+    }
+
+    /// Узел, слушающий конкретный адрес, обязан принимать его в Host —
+    /// иначе LAN-клиент получает 403 (issue #19).
+    #[test]
+    fn адрес_привязки_разрешается_сам_собой() {
+        assert_eq!(
+            resolve_allowed_hosts("192.0.2.10", &[]),
+            vec!["192.0.2.10".to_string()]
+        );
+    }
+
+    /// Конфиг и окружение дополняют адрес привязки; повторы без учёта
+    /// регистра и пустые записи схлопываются.
+    #[test]
+    fn конфиг_дополняет_адрес_привязки_без_повторов() {
+        let configured = vec![
+            "192.0.2.10".to_string(),
+            " ci.internal:8011 ".to_string(),
+            String::new(),
+            "CI.INTERNAL:8011".to_string(),
+        ];
+        assert_eq!(
+            resolve_allowed_hosts("192.0.2.10", &configured),
+            vec!["192.0.2.10".to_string(), "ci.internal:8011".to_string()]
+        );
+    }
+
+    /// Список из переменной окружения: разделитель — запятая, пробелы
+    /// обрезаются, пустые элементы отбрасываются.
+    #[test]
+    fn список_из_строки_обрезается_и_чистится() {
+        assert_eq!(
+            parse_allowed_hosts_list(" a , ,b:1 , "),
+            vec!["a".to_string(), "b:1".to_string()]
+        );
+        assert!(parse_allowed_hosts_list("   ").is_empty());
     }
 }

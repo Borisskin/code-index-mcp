@@ -85,6 +85,7 @@ mod tests {
             me: MeSection {
                 ip: "192.0.2.10".to_string(),
                 token: None,
+                allowed_hosts: Vec::new(),
             },
             paths: vec![
                 ServePathEntry {
@@ -117,6 +118,7 @@ mod tests {
             me: MeSection {
                 ip: "192.0.2.10".to_string(),
                 token: None,
+                allowed_hosts: Vec::new(),
             },
             paths: vec![ServePathEntry {
                 alias: "ut".to_string(),

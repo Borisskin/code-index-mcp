@@ -11,6 +11,7 @@
 // [me]
 // ip = "192.0.2.10"
 // # token = "..."   # опционально, в rc6 не валидируется (заготовка под rc7)
+// # allowed_hosts = ["192.0.2.10", "ci.internal:8011"]  # опционально: какие Host принимает /mcp
 //
 // [[paths]]
 // alias = "ut"
@@ -96,6 +97,19 @@ pub struct MeSection {
     /// проверяется ни в одном handler-е — заготовка под rc7.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Дополнительные значения заголовка `Host`, которые принимает роут
+    /// `/mcp`. Нужны, когда узел слушает LAN-адрес: проверка rmcp по
+    /// умолчанию пропускает только `localhost`, `127.0.0.1` и `::1`
+    /// (защита от DNS-rebinding), поэтому внешний клиент получал
+    /// `403 Forbidden: Host header is not allowed`.
+    ///
+    /// Записи — `host` либо `host:port` (порт сверяется только у второго
+    /// вида). Адрес привязки (`--host` / `[me].ip`) разрешается и без этой
+    /// секции; при `--host 0.0.0.0` адреса перечисляет оператор.
+    /// Изменения подхватываются при перезапуске serve.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Запись `[[paths]]`. Без `path` — путь к корню репозитория хранится только в
@@ -409,6 +423,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = load_or_default_from(tmp.path()).unwrap();
         assert!(result.is_none());
+    }
+
+    /// `[me].allowed_hosts` — необязательный ключ: старые serve.toml
+    /// парсятся как раньше (пустой список), новые перечисляют значения
+    /// заголовка Host для роута `/mcp`.
+    #[test]
+    fn allowed_hosts_is_optional_and_parsed() {
+        let without = r#"
+            [me]
+            ip = "192.0.2.10"
+        "#;
+        let cfg = parse_str(without).unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.me.allowed_hosts.is_empty());
+
+        let with = r#"
+            [me]
+            ip = "192.0.2.10"
+            allowed_hosts = ["192.0.2.10", "ci.internal:8011"]
+
+            [[paths]]
+            alias = "ut"
+            ip = "192.0.2.50"
+        "#;
+        let cfg = parse_str(with).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.me.allowed_hosts, vec!["192.0.2.10", "ci.internal:8011"]);
     }
 
     #[test]
