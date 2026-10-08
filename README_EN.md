@@ -394,6 +394,22 @@ All fields are optional; omitting the section uses the defaults. The default is 
 
 In federation mode `serve` watches `serve.toml` and `daemon.toml` itself: half a second after a save the repository table is rebuilt as a whole, and a new alias is served without a restart — MCP sessions that are already open see it right away. An edit is applied all or nothing: a parse error, a database that fails to open, or a local alias in `serve.toml` without an entry in `daemon.toml` keeps the previous table. To apply by hand — `POST /reload` (protected by the same allowed-address list); the result of the last attempt is the `config_reload` field of the `health` tool. Changing `[me].ip` or `[pool]` still requires a restart. The daemon also watches `daemon.toml` itself: a new directory starts being indexed and a removed one stops being tracked without a restart — `daemon reload` remains a manual fallback.
 
+### Which `Host` values `/mcp` accepts (v1.8.6)
+
+The `/mcp` route is protected against DNS rebinding: a request passes only with a `Host` header that is allowed explicitly. Before v1.8.6 the list was hard-wired to loopback (`localhost`, `127.0.0.1`, `::1`), so a node listening on a network address (`--host 0.0.0.0` or `[me].ip`) rejected every external MCP client — `403 Forbidden: Host header is not allowed` — while its own `/federate/*` kept working. Now the defaults are extended with:
+
+- the **bind address** (`--host` or `[me].ip`) — added automatically, except `0.0.0.0` and `::`;
+- **`[me].allowed_hosts`** in `serve.toml` — `host` or `host:port` values (the port is checked only in the second form);
+- **`CODE_INDEX_ALLOWED_HOSTS`** — the same values, comma-separated; it also works in single-repository mode, where `serve.toml` is not read.
+
+```toml
+[me]
+ip = "192.0.2.10"
+allowed_hosts = ["192.0.2.10:8011", "ci.internal"]
+```
+
+The check is never disabled: a value neither listed nor among the defaults still gets `403`. The list is baked into the service at startup, so editing it requires a `serve` restart — as with `[me].ip` and `[pool]`. With `--host 0.0.0.0` the operator lists the addresses: guessing under which name clients will arrive is not safe.
+
 ### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
 
 When BSL repos are present in `daemon.toml` (`language = "bsl"`), 13 BSL-specific tools are auto-registered:

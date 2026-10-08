@@ -71,6 +71,16 @@
    ```
    На streamable HTTP вернётся что-то структурированное, не connection refused.
 
+   Ответ `403` на `/mcp` — две разные причины, различать по телу.
+   `Forbidden: Host header is not allowed` — заголовок `Host` не разрешён:
+   проходят loopback-значения и адрес привязки, остальные имена перечисляются
+   в `[me].allowed_hosts` файла `serve.toml` либо в `CODE_INDEX_ALLOWED_HOSTS`
+   через запятую (список читается при старте — после правки перезапустить
+   `serve`; что разрешено сейчас, видно в `serve.log` строкой
+   `MCP /mcp принимает Host: [...]`). `{"error":"forbidden","peer":"..."}` —
+   IP клиента не в whitelist федерации: допустимы loopback и адреса из
+   `[[paths]]`.
+
 3. Health daemon (порт из `daemon.json`):
    ```bash
    curl http://127.0.0.1:$(python -c "import json; print(json.load(open('C:/tools/code-index/daemon.json'))['http_port'])")/health
