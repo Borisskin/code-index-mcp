@@ -29,6 +29,7 @@ pub mod get_object_profile;
 pub mod get_object_structure;
 pub mod get_register_writers;
 pub mod get_role_rights;
+pub mod posting_map;
 pub mod search_terms;
 
 pub use bsl_sql::BslSqlTool;
@@ -43,6 +44,7 @@ pub use get_object_profile::GetObjectProfileTool;
 pub use get_object_structure::GetObjectStructureTool;
 pub use get_register_writers::GetRegisterWritersTool;
 pub use get_role_rights::GetRoleRightsTool;
+pub use posting_map::PostingMapTool;
 pub use search_terms::SearchTermsTool;
 
 use serde_json::{json, Value};

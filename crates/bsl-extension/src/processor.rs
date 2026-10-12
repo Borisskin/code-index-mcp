@@ -147,6 +147,16 @@ impl LanguageProcessor for BslLanguageProcessor {
             // и варианты настроек (таблицы dcs_schemas / dcs_datasets). Вместо
             // чтения Template.xml по кускам и пересказа его вручную.
             Arc::new(crate::tools::GetDcsSchemaTool),
+            // posting_map — карта механизма проведения документа: декларативный
+            // состав движений (recorder-рёбра `data_links`), код, достижимый от
+            // обработчика проведения по графу вызовов, ФАКТИЧЕСКИЕ записи
+            // движений (вызовы `Движения.<Регистр>.Добавить`/`.Записать` из
+            // таблицы `calls`) и упоминания регистров в коде. Отвечает на вопрос
+            // «где формируются движения этого документа», на который
+            // get_register_writers (только декларация) и find_references (плоский
+            // список обращений без процедур и без различения чтения и записи) не
+            // отвечают.
+            Arc::new(crate::tools::PostingMapTool),
         ]
     }
 
@@ -342,12 +352,13 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 13 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // 14 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
         // + get_register_writers (регистраторы/движения) + get_role_rights
         // (права ролей) + bsl_sql (произвольный read-only SELECT)
         // + get_object_profile (паспорт объекта за 1 вызов)
         // + find_references (карта влияния: реверс data_links + код + права)
-        // + get_dcs_schema (макет СКД: наборы, поля, текст запроса, варианты).
+        // + get_dcs_schema (макет СКД: наборы, поля, текст запроса, варианты)
+        // + posting_map (карта механизма проведения: записи движений по регистрам).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -364,7 +375,8 @@ mod tests {
         assert!(names.contains(&"get_object_profile"));
         assert!(names.contains(&"find_references"));
         assert!(names.contains(&"get_dcs_schema"));
-        assert_eq!(tools.len(), 13);
+        assert!(names.contains(&"posting_map"));
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]

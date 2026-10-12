@@ -182,6 +182,7 @@ pub const DEFAULT_CAP_TOOLS: &[&str] = &[
     "bsl_sql",
     "find_references",
     "get_register_writers",
+    "posting_map",
 ];
 
 fn default_cap_set() -> HashSet<String> {
