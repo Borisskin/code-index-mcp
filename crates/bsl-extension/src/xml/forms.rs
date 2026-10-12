@@ -41,6 +41,14 @@ pub struct FormHandler {
     /// Имена элементов уникальны в пределах формы, поэтому путь вложенности
     /// не хранится: к элементу обращаются как `Элементы.<Имя>`.
     pub element: Option<String>,
+    /// Вид привязки: `"event"` — событие формы или её элемента; `"command"` —
+    /// команда формы (`<Command name="Кнопка"><Action>Процедура</Action>`).
+    ///
+    /// Платформа зовёт процедуру в обоих случаях — вызова в коде нет ни у той,
+    /// ни у другой. Но команда отличается тем, что её видно в интерфейсе: это
+    /// кнопка, и имя у неё своё, а не имя события. Для графа и привязок
+    /// `get_callers` разницы нет, а в выдаче `get_form_handlers` — есть.
+    pub kind: &'static str,
 }
 
 /// Нормализует имя события ФОРМЫ к русскому виду (как в конфигураторе).
@@ -178,13 +186,20 @@ pub fn form_event_to_russian(event: &str) -> &str {
 pub fn handlers_to_json(handlers: &[FormHandler]) -> Result<String> {
     let arr: Vec<serde_json::Value> = handlers
         .iter()
-        .map(|h| match &h.element {
-            Some(el) => serde_json::json!({
-                "event": h.event,
-                "handler": h.handler,
-                "element": el,
-            }),
-            None => serde_json::json!({"event": h.event, "handler": h.handler}),
+        .map(|h| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("event".to_string(), serde_json::json!(h.event));
+            obj.insert("handler".to_string(), serde_json::json!(h.handler));
+            if let Some(el) = &h.element {
+                obj.insert("element".to_string(), serde_json::json!(el));
+            }
+            // Пометку `kind` пишем только командам: у событий она по умолчанию,
+            // и лишний ключ в каждой строке — это рост `handlers_json` на всех
+            // формах конфигурации ради значения, которое и так ожидаемо.
+            if h.kind == "command" {
+                obj.insert("kind".to_string(), serde_json::json!("command"));
+            }
+            serde_json::Value::Object(obj)
         })
         .collect();
     Ok(serde_json::to_string(&arr)?)
@@ -200,6 +215,8 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
     let mut current_event_name: Option<String> = None;
+    // Имя команды, внутри которой мы находимся (`<Command name="Кнопка">`).
+    let mut current_command_name: Option<String> = None;
     let mut tag_stack: Vec<String> = Vec::new();
     // Владельцы обработчиков: по элементу формы на каждый открытый тег с
     // атрибутом `name` (`<InputField name="Товар">`, `<Table name="Товары">`).
@@ -226,6 +243,11 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
                 if local == "Event" {
                     current_event_name = name_value;
                     owner_stack.push(None);
+                } else if local == "Command" {
+                    // Команда формы: имя команды видно в интерфейсе как кнопка,
+                    // а процедуру-обработчик задаёт вложенный `<Action>`.
+                    current_command_name = name_value;
+                    owner_stack.push(None);
                 } else {
                     owner_stack.push(name_value.filter(|v| !v.is_empty()));
                 }
@@ -244,6 +266,23 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
                                 event: form_event_to_russian(event_name).to_string(),
                                 handler: handler_name,
                                 element,
+                                kind: "event",
+                            });
+                        }
+                    }
+                } else if local == "Action" {
+                    // `<Action>` внутри `<Command>`: процедура-обработчик
+                    // команды формы. Платформа зовёт её так же, как событие, —
+                    // вызова в коде нет, и без этой ветки такая процедура
+                    // выглядела неиспользуемой.
+                    let handler_name = std::mem::take(&mut acc).trim().to_string();
+                    if let Some(cmd) = current_command_name.clone() {
+                        if !handler_name.is_empty() && !cmd.is_empty() {
+                            out.push(FormHandler {
+                                event: cmd,
+                                handler: handler_name,
+                                element: None,
+                                kind: "command",
                             });
                         }
                     }
@@ -253,19 +292,22 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
                 if local == "Event" {
                     current_event_name = None;
                 }
+                if local == "Command" {
+                    current_command_name = None;
+                }
                 tag_stack.pop();
                 owner_stack.pop();
             }
             Ok(Event::Text(text)) => {
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                if parent == "Event" {
+                if parent == "Event" || parent == "Action" {
                     let txt = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
                     acc.push_str(&txt);
                 }
             }
             Ok(Event::GeneralRef(r)) => {
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                if parent == "Event" {
+                if parent == "Event" || parent == "Action" {
                     acc.push_str(&general_ref_text(&r));
                 }
             }
@@ -398,6 +440,49 @@ mod tests {
         assert_eq!(field.element.as_deref(), Some("СуммаДокумента"));
     }
 
+    /// Команды формы: `<Command name="Кнопка"><Action>Процедура</Action>`.
+    /// Платформа зовёт эту процедуру так же, как событие, — вызова в коде нет,
+    /// и без разбора команд она выглядела неиспользуемой, а кнопка на форме —
+    /// «мёртвой».
+    #[test]
+    fn parses_form_command_action() {
+        let xml = r#"<?xml version="1.0"?>
+<Form>
+  <Commands>
+    <Command name="ЗаполнитьБилеты" id="1">
+      <Title><v8:item><v8:content>Заполнить</v8:content></v8:item></Title>
+      <Action>ЗаполнитьБилетыОбработчик</Action>
+      <CurrentRowUse>DontUse</CurrentRowUse>
+    </Command>
+    <Command name="ОК" id="3">
+      <Action>ОК</Action>
+    </Command>
+  </Commands>
+  <Events>
+    <Event name="OnOpen">ПриОткрытии</Event>
+  </Events>
+</Form>"#;
+        let handlers = parse_form_xml(xml).unwrap();
+        assert_eq!(
+            handlers.len(),
+            3,
+            "два обработчика команд и одно событие: {handlers:?}"
+        );
+        let cmd = handlers
+            .iter()
+            .find(|h| h.event == "ЗаполнитьБилеты")
+            .expect("команда обязана разобраться");
+        assert_eq!(cmd.kind, "command");
+        assert_eq!(cmd.handler, "ЗаполнитьБилетыОбработчик");
+        assert_eq!(cmd.element, None);
+        // Заголовок команды обработчиком не становится.
+        assert!(!handlers.iter().any(|h| h.handler == "Заполнить"));
+        // Помечаем только команды: у событий ключа `kind` в JSON нет.
+        let json = handlers_to_json(&handlers).unwrap();
+        assert_eq!(json.matches("\"kind\"").count(), 2, "пометка у двух команд");
+        assert!(json.contains("\"kind\":\"command\""));
+    }
+
     #[test]
     fn form_events_translated_in_both_dump_formats() {
         // Имя события переводится, имя процедуры остаётся как в модуле.
@@ -439,11 +524,13 @@ mod tests {
                 event: "OnOpen".into(),
                 handler: "ПриОткрытии".into(),
                 element: None,
+                kind: "event",
             },
             FormHandler {
                 event: "OnChange".into(),
                 handler: "СуммаПриИзменении".into(),
                 element: Some("Сумма".into()),
+                kind: "event",
             },
         ];
         let json = handlers_to_json(&handlers).unwrap();

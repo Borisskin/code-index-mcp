@@ -49,7 +49,8 @@ pub fn form_bindings(storage: &Storage, function_name: &str) -> Vec<Value> {
 fn confirmed_bindings(conn: &Connection, function_name: &str) -> Vec<(FormLocation, Vec<Value>)> {
     let sql = "SELECT f.path FROM functions fn \
                JOIN files f ON f.id = fn.file_id \
-               WHERE fn.name = ?1 AND f.path LIKE '%/Forms/%' \
+               WHERE fn.name = ?1 \
+                 AND (f.path LIKE '%/Forms/%' OR f.path LIKE '%/CommonForms/%') \
                ORDER BY f.path";
     let Ok(mut stmt) = conn.prepare(sql) else {
         return Vec::new();
@@ -115,6 +116,28 @@ impl FormLocation {
     /// Всё остальное (модуль объекта, общий модуль, модуль команды) — `None`.
     fn from_module_path(path: &str) -> Option<Self> {
         let parts: Vec<&str> = path.split('/').collect();
+
+        // Общая форма: `<...>/CommonForms/<Форма>/Ext/Form/Module.bsl`. Владельца
+        // вида-объекта у неё нет — владелец и есть папка вида, а имя формы
+        // совпадает с именем объекта: ровно так эта форма записана в
+        // `metadata_forms` (`CommonForms.<Имя>` / `<Имя>`). Без этой ветки
+        // обработчики общих форм не находились вовсе.
+        if let Some(at) = parts.iter().position(|p| *p == "CommonForms") {
+            let name = *parts.get(at + 1)?;
+            let tail = parts.get(at + 2..)?;
+            let root = parts[..=at + 1].join("/");
+            let descriptor_path = match tail {
+                ["Ext", "Form", "Module.bsl"] => format!("{}/Ext/Form.xml", root),
+                ["Module.bsl"] => format!("{}/Form.form", root),
+                _ => return None,
+            };
+            return Some(Self {
+                owner_full_name: format!("CommonForms.{}", name),
+                form_name: name.to_string(),
+                descriptor_path,
+            });
+        }
+
         let forms_at = parts.iter().position(|p| *p == "Forms")?;
         // Нужны папка вида-объекта и сам объект слева, имя формы справа.
         if forms_at < 2 || forms_at + 1 >= parts.len() {
@@ -175,9 +198,17 @@ fn bindings_of_form(conn: &Connection, form: &FormLocation, function_name: &str)
         .map(|h| {
             let event = h.get("event").and_then(|v| v.as_str()).unwrap_or("");
             let element = h.get("element").and_then(|v| v.as_str());
+            // Вид привязки: событие формы или команда формы. Платформа зовёт
+            // процедуру в обоих случаях, но имя у команды своё — и в ответе это
+            // должно читаться, иначе «событие ЗаполнитьБилеты» сбивает с толку.
+            let binding = match h.get("kind").and_then(|v| v.as_str()) {
+                Some("command") => "command",
+                _ => "event",
+            };
             let mut rec = json!({
                 "kind": "form_binding",
-                "caller": caller_label(form, event, element),
+                "binding": binding,
+                "caller": caller_label(form, event, element, binding),
                 "callee": h.get("handler").cloned().unwrap_or(Value::Null),
                 "event": event,
             });
@@ -192,17 +223,22 @@ fn bindings_of_form(conn: &Connection, form: &FormLocation, function_name: &str)
         .collect()
 }
 
-/// Человекочитаемое «кто вызывает»: форма, событие и — если обработчик
+/// Человекочитаемое «кто вызывает»: форма, вид привязки и — если обработчик
 /// назначен элементу, а не самой форме — имя элемента.
-fn caller_label(form: &FormLocation, event: &str, element: Option<&str>) -> String {
+fn caller_label(form: &FormLocation, event: &str, element: Option<&str>, binding: &str) -> String {
+    let what = if binding == "command" {
+        "команда"
+    } else {
+        "событие"
+    };
     match element {
         Some(el) => format!(
-            "Форма {}/{}, элемент {}, событие {}",
-            form.owner_full_name, form.form_name, el, event
+            "Форма {}/{}, элемент {}, {} {}",
+            form.owner_full_name, form.form_name, el, what, event
         ),
         None => format!(
-            "Форма {}/{}, событие {}",
-            form.owner_full_name, form.form_name, event
+            "Форма {}/{}, {} {}",
+            form.owner_full_name, form.form_name, what, event
         ),
     }
 }
@@ -260,6 +296,47 @@ mod tests {
             "base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form/Command/Module.bsl"
         )
         .is_none());
+    }
+
+    /// Общая форма: владельца вида-объекта у неё нет, владелец — сама папка
+    /// вида, а имя формы совпадает с именем объекта.
+    #[test]
+    fn common_form_module_path_resolves() {
+        let loc =
+            FormLocation::from_module_path("base/CommonForms/ОбщаяФормаВыбора/Ext/Form/Module.bsl")
+                .expect("модуль общей формы должен разбираться");
+        assert_eq!(loc.owner_full_name, "CommonForms.ОбщаяФормаВыбора");
+        assert_eq!(loc.form_name, "ОбщаяФормаВыбора");
+        assert_eq!(
+            loc.descriptor_path,
+            "base/CommonForms/ОбщаяФормаВыбора/Ext/Form.xml"
+        );
+        // Общий модуль общей формой не становится.
+        assert!(
+            FormLocation::from_module_path("base/CommonModules/Общее/Ext/Module.bsl").is_none()
+        );
+    }
+
+    /// Команда формы в ответе называется командой, а не событием.
+    #[test]
+    fn command_binding_label_says_command() {
+        let form = FormLocation {
+            owner_full_name: "Documents.X".to_string(),
+            form_name: "ФормаДокумента".to_string(),
+            descriptor_path: "base/Documents/X/Forms/ФормаДокумента/Ext/Form.xml".to_string(),
+        };
+        assert_eq!(
+            caller_label(&form, "Заполнить", None, "command"),
+            "Форма Documents.X/ФормаДокумента, команда Заполнить"
+        );
+        assert_eq!(
+            caller_label(&form, "ПриОткрытии", None, "event"),
+            "Форма Documents.X/ФормаДокумента, событие ПриОткрытии"
+        );
+        assert_eq!(
+            caller_label(&form, "ПриИзменении", Some("Сумма"), "event"),
+            "Форма Documents.X/ФормаДокумента, элемент Сумма, событие ПриИзменении"
+        );
     }
 
     #[test]

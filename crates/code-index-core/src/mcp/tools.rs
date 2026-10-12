@@ -650,6 +650,37 @@ pub(crate) fn declarative_callers_of(
     }
 }
 
+/// Декларативные привязки как записи графа вызовов — для инструментов, которые
+/// ходят по рёбрам (`get_call_tree`), а не отдают готовые записи (`get_callers`).
+///
+/// Источник ребра берётся по `path` из самой привязки: в `CallRecord` путь
+/// хранится идентификатором файла. Файла в индексе нет — ребро остаётся без
+/// источника, но привязку не выбрасываем: она и есть ответ.
+pub(crate) fn declarative_call_records(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Vec<CallRecord> {
+    declarative_callers_of(entry, storage, function_name)
+        .into_iter()
+        .filter_map(|v| {
+            let caller = v.get("caller")?.as_str()?.to_string();
+            let file_id = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .and_then(|p| storage.get_file_id_by_path(p).ok().flatten())
+                .unwrap_or(0);
+            Some(CallRecord {
+                id: None,
+                file_id,
+                caller,
+                callee: function_name.to_string(),
+                line: 0,
+            })
+        })
+        .collect()
+}
+
 /// Вызовы с квалификатором от процессора репо (1С). Для репо без процессора — пусто.
 pub(crate) fn qualified_callers_of(
     entry: &RepoEntry,
@@ -1534,7 +1565,16 @@ pub(crate) async fn get_call_tree(
             down,
             depth,
             cap,
-            &|name| qualified_callers_of(entry, &storage, name),
+            &|name| {
+                // Вверх «вызыватели» — это не только вызовы из кода: у
+                // платформенных точек входа (событие формы, подписка, перехват
+                // расширением, обработчик по соглашению об имени) вызова в коде
+                // нет, и в таблице `calls` их не найти. Без этого дерево вверх
+                // обрывалось на процедуре-обработчике.
+                let mut recs = qualified_callers_of(entry, &storage, name);
+                recs.extend(declarative_call_records(entry, &storage, name));
+                recs
+            },
             &|file_id, caller, callee| {
                 let mut cache = bound.borrow_mut();
                 let map = cache

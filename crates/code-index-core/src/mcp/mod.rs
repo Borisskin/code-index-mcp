@@ -1334,7 +1334,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord."
+        description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord. Для 1С к вызовам из кода добавляются декларативные привязки (поле kind): обработчик события формы, обработчик команды формы (binding=command), подписка на событие, перехват расширением, обработчик по соглашению об имени — вызова в коде у них нет, процедуру зовёт платформа."
     )]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -1397,7 +1397,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}."
+        description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Для 1С обход ВВЕРХ добавляет платформенные точки входа, которых нет в таблице calls: событие и команда формы, подписка на событие, перехват расширением, обработчик по соглашению об имени. Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}."
     )]
     async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {

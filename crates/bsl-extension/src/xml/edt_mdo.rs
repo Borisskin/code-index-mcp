@@ -1022,6 +1022,9 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                             event: form_event_to_russian(&ev).to_string(),
                             handler: nm,
                             element,
+                            // Раскладка EDT: команды формы здесь пока не
+                            // разбираются, все обработчики — события.
+                            kind: "event",
                         });
                     }
                     in_handlers = false;
