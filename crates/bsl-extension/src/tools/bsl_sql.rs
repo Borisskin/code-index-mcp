@@ -77,7 +77,13 @@ impl IndexTool for BslSqlTool {
          to_object, link_kind, is_composite, is_universal), role_rights(role_name, object_name, right_name), \
          metadata_code_usages(object_ref, object_ref_key, member_path, usage_kind, file_path, line; \
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
-         object_ref_key уже в нижнем регистре для поиска из приложения), procedure_enrichment(proc_key, \
+         object_ref_key уже в нижнем регистре для поиска из приложения; \
+         usage_kind: manager | ref_type | query | template_call | common_template_call | \
+         template_call_via_manager | template_call_via_receiver; ВНИМАНИЕ: у строк \
+         template_call_via_receiver object_ref = 'Template'/'CommonTemplate' (имя макета — \
+         в member_path), у template_call_via_manager object_ref = владелец 'Catalog.X', \
+         то есть object_ref у template* — НЕ имя объекта перечня; форма ПолучитьМакет(\"Y\") \
+         без владельца даёт object_ref='Template' и member_path='Y'), procedure_enrichment(proc_key, \
          terms, signature), direct_edge_files(caller, callee, source_file), \
          dcs_schemas(template_full_name, owner_full_name, content_file, data_sets_json, \
          links_json, calculated_fields_json, totals_json, parameters_json, variants_json, \

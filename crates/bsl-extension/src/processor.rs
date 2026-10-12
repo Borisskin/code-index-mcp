@@ -163,6 +163,14 @@ impl LanguageProcessor for BslLanguageProcessor {
             // список обращений без процедур и без различения чтения и записи) не
             // отвечают.
             Arc::new(crate::tools::PostingMapTool),
+            // find_unreferenced_objects — объекты без ссылок (Требование 2 ТЗ,
+            // формула c2-v1): объединяет data_links + role_rights +
+            // metadata_code_usages + канал макетов из четырёх источников
+            // (строковые пути, голая форма ПолучитьМакет("X"), метод-форма
+            // Справочники.X.ПолучитьМакет("Y"), ПолучитьОбщийМакет) и честно
+            // показывает, что именно проверено (channels_applied /
+            // channels_not_applied).
+            Arc::new(crate::tools::FindUnreferencedObjectsTool),
         ]
     }
 
@@ -361,13 +369,14 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 14 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // 15 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
         // + get_register_writers (регистраторы/движения) + get_role_rights
         // (права ролей) + bsl_sql (произвольный read-only SELECT)
         // + get_object_profile (паспорт объекта за 1 вызов)
         // + find_references (карта влияния: реверс data_links + код + права)
         // + get_dcs_schema (макет СКД: наборы, поля, текст запроса, варианты)
         // + posting_map (карта механизма проведения: записи движений по регистрам).
+        // + find_unreferenced_objects (объекты без ссылок, формула c2-v1).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -388,7 +397,8 @@ mod tests {
         assert!(names.contains(&"query_call_sites"));
         assert!(names.contains(&"get_node_structure"));
         assert!(names.contains(&"get_line_context"));
-        assert_eq!(tools.len(), 17);
+        assert!(names.contains(&"find_unreferenced_objects"));
+        assert_eq!(tools.len(), 18);
     }
 
     #[test]

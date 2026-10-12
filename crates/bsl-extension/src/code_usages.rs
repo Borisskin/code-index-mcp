@@ -5,7 +5,7 @@
 // «где в коде упоминается объект X». Лёгкий source-aware regex-слой, порт
 // логики rlm-tools-bsl (`_extract_code_usages` / `_scan_module`).
 //
-// Ловит три вида обращений:
+// Ловит обращения к объектам метаданных:
 //   * `manager`  — обращение к менеджеру коллекции `Документы.X` / `Documents.X`
 //     (ищется в РЕАЛЬНОМ коде: строковые литералы и комментарии вырезаны,
 //     включая многострочные литералы);
@@ -13,9 +13,30 @@
 //     либо `"DocumentRef.X"` (EN);
 //   * `query`    — путь метаданных в строковом литерале (текст запроса):
 //     `Документ.X` и `Документ.X.Товары` (3-й сегмент = имя ТЧ → `member_path`).
+//   * `template_call`       — `ПолучитьМакет("Имя")`: имя макета в литерале
+//     (аргумент — ОДИН строковый литерал). Владелец макета тут НЕ резолвится —
+//     `extract_code_usages` не знает путь файла; пара (владелец, макет)
+//     собирается инструментом `find_unreferenced_objects` по `file_path`.
+//     `object_ref = "Template"`, `member_path = Some(имя макета)`.
+//   * `common_template_call` — `ПолучитьОбщийМакет("Имя")`: `object_ref =
+//     "CommonTemplate"`, `member_path = Some(имя общего макета)`.
+//   * `template_call_via_manager` — метод-форма `Справочники.X.ПолучитьМакет("Y")`
+//     (и EN-коллекции `Catalogs.X`): приёмник — менеджер коллекции из
+//     [`manager_map`], владелец макета известен сразу, без резолва по файлу:
+//     `object_ref = "<canonical>.<ВторойИдент>"` (например `Catalog.X`),
+//     `member_path = Some("Y")`.
+//   * `template_call_via_receiver` — метод-форма с НЕраспознанным приёмником
+//     (`Переменная.ПолучитьМакет("Y")`): владельца по имени приёмника не
+//     вывести; строка кладётся в индекс СЧЁТЧИКОМ непокрытой формы (макет не
+//     снимается), `object_ref = "Template"`/`"CommonTemplate"`.
 //
 // Что НЕ ловит (осознанно): доступ через локальные переменные
 // (`Док = Документы.X; Док.Товары`) — нужен type inference, вне охвата.
+// Также не индексируются формы, названные в `channels_not_applied` ответа
+// `find_unreferenced_objects`: `template_call_non_literal` (аргумент —
+// переменная/склейка/второй аргумент), `template_call_english`
+// (`GetTemplate`/`GetCommonTemplate`), `template_call_multiline` (вызов с
+// переносом строки до литерала).
 //
 // Русские формы множественного числа/типов нерегулярны (РегистрСведений →
 // РегистрыСведений, Обработка → Обработки) — задаются явной таблицей, не правилом.
@@ -30,9 +51,12 @@ pub struct CodeUsage {
     pub object_ref: String,
     /// `object_ref.to_lowercase()` — для индексного поиска без UDF (кириллица).
     pub object_ref_key: String,
-    /// Имя ТЧ для `query` (3-й сегмент пути), иначе `None`.
+    /// Имя ТЧ для `query` (3-й сегмент пути), имя макета для `template_call` /
+    /// `common_template_call`, иначе `None`.
     pub member_path: Option<String>,
-    /// Вид обращения: `manager` | `ref_type` | `query`.
+    /// Вид обращения: `manager` | `ref_type` | `query` | `template_call` |
+    /// `common_template_call` | `template_call_via_manager` |
+    /// `template_call_via_receiver`.
     pub usage_kind: &'static str,
     /// Номер строки в модуле (1-based).
     pub line: usize,
@@ -384,10 +408,18 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Маркер строкового литерала в `code`-строке от `scan_line`: встаёт на место
+/// кавычки-открытия. По нему `template_calls` связывает вызов с содержимым
+/// литерала (сам литерал вырезан из `code`). Управляющий символ не бывает
+/// частью реального BSL-кода, поэтому слова/пары `dotted_pairs` он не ломает.
+const STRING_MARKER: char = '\u{0}';
+
 /// Разделить строку кода на «реальный код» (без строк/комментариев) и список
 /// фрагментов строковых литералов. Порт `_scan_module` (по одной строке).
 /// `in_string` — открыт ли многострочный литерал с предыдущей строки.
-/// Возвращает `(code, strings, in_string_after)`.
+/// Возвращает `(code, strings, in_string_after)`. Каждому литералу в `code`
+/// отвечает маркер [`STRING_MARKER`] в порядке появления (нумерация маркеров
+/// совпадает с нумерацией `strings`), — это позволяет искать `Вызов("литерал")`.
 fn scan_line(raw: &str, mut in_string: bool) -> (String, Vec<String>, bool) {
     let chars: Vec<char> = raw.chars().collect();
     let n = chars.len();
@@ -396,6 +428,11 @@ fn scan_line(raw: &str, mut in_string: bool) -> (String, Vec<String>, bool) {
     let mut strings: Vec<String> = Vec::new();
     // Начало текущего строкового сегмента. -1 = вне строки.
     let mut seg_start: isize = if in_string { 0 } else { -1 };
+    if in_string {
+        // Продолжение многострочного литерала: маркер ставится на его месте и
+        // в начале строки, чтобы порядок маркеров и `strings` совпадал.
+        code.push(STRING_MARKER);
+    }
 
     while i < n {
         let ch = chars[i];
@@ -415,6 +452,7 @@ fn scan_line(raw: &str, mut in_string: bool) -> (String, Vec<String>, bool) {
         } else if ch == '"' {
             in_string = true;
             seg_start = (i + 1) as isize;
+            code.push(STRING_MARKER);
             i += 1;
         } else if ch == '/' && i + 1 < n && chars[i + 1] == '/' {
             break; // комментарий до конца строки — ни код, ни строка
@@ -428,6 +466,156 @@ fn scan_line(raw: &str, mut in_string: bool) -> (String, Vec<String>, bool) {
         strings.push(chars[seg_start as usize..].iter().collect());
     }
     (code, strings, in_string)
+}
+
+fn is_space(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+/// Имена макетов из вызовов `ПолучитьМакет("Имя")` / `ПолучитьОбщийМакет("Имя")`
+/// в РЕАЛЬНОМ коде строки (Требование 2 ТЗ C2):
+///   * имя — ОДИН строковый литерал-аргумент: `ПолучитьМакет("X" + Y)`,
+///     `ПолучитьМакет(Переменная)`, второй аргумент — цели не дают;
+///   * ГОЛАЯ форма (без приёмника) — `template_call`/`common_template_call`
+///     (`object_ref = "Template"`/`"CommonTemplate"`); владельца резолвит
+///     инструмент по `file_path`;
+///   * МЕТОД-форма — `Справочники.X.ПолучитьМакет("Y")` (EN: `Catalogs.X`):
+///     если первый идентификатор приёмника есть в [`manager_map`], владелец
+///     известен сразу → `template_call_via_manager` с
+///     `object_ref = "<canonical>.<ВторойИдент>"` (резолв по файлу не нужен);
+///     иначе (`Переменная.ПолучитьМакет("Y")`) — `template_call_via_receiver`
+///     (непокрытая форма: владельца не вывести, макет не снимается);
+///   * имя обязано быть похожим на идентификатор 1С (буквы/цифры/`_`).
+///
+/// Возвращает разобранные строки обращений.
+fn template_calls(code: &str, strings: &[String], line: usize) -> Vec<CodeUsage> {
+    let chars: Vec<char> = code.chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if !is_word(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_word(chars[i]) {
+            i += 1;
+        }
+        let ident: String = chars[start..i].iter().collect();
+        let kind = match ident.to_lowercase().as_str() {
+            "получитьмакет" => "template_call",
+            "получитьобщиймакет" => "common_template_call",
+            _ => continue,
+        };
+        let common = kind == "common_template_call";
+        let method_form = start > 0 && chars[start - 1] == '.';
+        // Владелец из менеджер-приёмника: `Справочники.X.ПолучитьМакет` →
+        // `Catalog.X`; None — приёмник не менеджер коллекции (или формы нет).
+        let manager_owner = if method_form {
+            receiver_manager_owner(&chars, start - 1)
+        } else {
+            None
+        };
+        let mut j = i;
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != '(' {
+            continue;
+        }
+        j += 1;
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != STRING_MARKER {
+            continue; // аргумент не литерал (выражение/переменная/перенос строки)
+        }
+        // Номер маркера = индекс литерала в `strings` этой строки.
+        let ordinal = chars[..j].iter().filter(|c| **c == STRING_MARKER).count();
+        j += 1;
+        // Только закрывающая скобка сразу: иначе это склейка или 2-й аргумент.
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != ')' {
+            continue;
+        }
+        i = j + 1;
+        let name = match strings.get(ordinal) {
+            Some(name) if !name.is_empty() && name.chars().all(is_word) => name.clone(),
+            _ => continue,
+        };
+        let (object_ref, object_ref_key, usage_kind) = match manager_owner {
+            Some(owner) => {
+                let key = owner.to_lowercase();
+                (owner, key, "template_call_via_manager")
+            }
+            None if method_form => (
+                if common { "CommonTemplate" } else { "Template" }.to_string(),
+                if common { "commontemplate" } else { "template" }.to_string(),
+                "template_call_via_receiver",
+            ),
+            None => (
+                if common { "CommonTemplate" } else { "Template" }.to_string(),
+                if common { "commontemplate" } else { "template" }.to_string(),
+                kind,
+            ),
+        };
+        out.push(CodeUsage {
+            object_ref,
+            object_ref_key,
+            member_path: Some(name),
+            usage_kind,
+            line,
+        });
+    }
+    out
+}
+
+/// Владелец макета из менеджер-приёмника метод-вызова: `dot` указывает на `.`
+/// перед именем метода; цепочка слева — `Идент(.Идент)*`. Если первый
+/// идентификатор цепочки — менеджер коллекции из [`manager_map`] (не менее двух
+/// сегментов), владелец известен: `<canonical>.<ВторойИдент>` (например
+/// `Справочники.Вакансии` → `Catalog.Вакансии`). Иначе `None` — приёмник не
+/// менеджер (переменная/объект), владельца по нему не вывести.
+fn receiver_manager_owner(chars: &[char], dot: usize) -> Option<String> {
+    let chain = receiver_chain(chars, dot);
+    if chain.len() < 2 {
+        return None;
+    }
+    let canon = manager_map().get(&chain[0].to_lowercase())?;
+    Some(format!("{}.{}", canon, chain[1]))
+}
+
+/// Идентификаторы цепочки `Идент(.Идент)*`, стоящей непосредственно перед
+/// точкой на позиции `dot` (`chars[dot] == '.'`), слева направо. Пустой вектор —
+/// перед точкой идентификатора нет.
+fn receiver_chain(chars: &[char], dot: usize) -> Vec<String> {
+    let mut segs: Vec<String> = Vec::new();
+    let mut k = dot;
+    loop {
+        if k == 0 {
+            segs.clear();
+            break;
+        }
+        let end = k; // эксклюзивная граница сегмента
+        let mut s = end;
+        while s > 0 && is_word(chars[s - 1]) {
+            s -= 1;
+        }
+        if s == end {
+            break; // нет идентификатора слева от точки — цепочка кончилась
+        }
+        segs.push(chars[s..end].iter().collect());
+        if s > 0 && chars[s - 1] == '.' {
+            k = s - 1;
+        } else {
+            break;
+        }
+    }
+    segs.reverse();
+    segs
 }
 
 /// Непересекающиеся пары `ident.ident` (аналог regex `(\w+)\.(\w+)` finditer).
@@ -600,6 +788,13 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
                 }
             }
         }
+
+        // template_call / common_template_call / *via_manager / *via_receiver —
+        // вызов в реальном коде, имя макета — строковый литерал-аргумент.
+        // У галых форм владелец здесь не резолвится (нет пути файла) — это
+        // делает find_unreferenced_objects; у метод-формы с менеджер-приёмником
+        // владелец уже в object_ref.
+        out.extend(template_calls(&code, &strings, lineno));
     }
     out
 }
@@ -1060,5 +1255,150 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].line, 3);
         assert_eq!(r[0].usage_kind, "query");
+    }
+
+    // ── template_call / common_template_call (Требование 2 ТЗ, C2) ──────────
+
+    #[test]
+    fn template_call_from_literal() {
+        let r = extract_code_usages("Схема = ПолучитьМакет(\"ПФ_MXL_Вакансия\");");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].object_ref, "Template");
+        assert_eq!(r[0].object_ref_key, "template");
+        assert_eq!(r[0].member_path.as_deref(), Some("ПФ_MXL_Вакансия"));
+        assert_eq!(r[0].usage_kind, "template_call");
+        assert_eq!(r[0].line, 1);
+    }
+
+    #[test]
+    fn common_template_call_from_literal() {
+        let r = extract_code_usages("Макет = ПолучитьОбщийМакет(\"ОбщаяПечатнаяФорма\");");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].object_ref, "CommonTemplate");
+        assert_eq!(r[0].object_ref_key, "commontemplate");
+        assert_eq!(r[0].member_path.as_deref(), Some("ОбщаяПечатнаяФорма"));
+        assert_eq!(r[0].usage_kind, "common_template_call");
+    }
+
+    #[test]
+    fn template_calls_accept_case_space_and_both_kinds_on_one_line() {
+        let r = extract_code_usages(
+            "А = получитьмакет ( \"Первый\" ); Б = ПолучитьОбщийМакет(\"Второй\");",
+        );
+        let got: Vec<(&str, Option<&str>)> = r
+            .iter()
+            .map(|u| (u.usage_kind, u.member_path.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("template_call", Some("Первый")),
+                ("common_template_call", Some("Второй")),
+            ]
+        );
+    }
+
+    #[test]
+    fn template_calls_ignored_outside_real_code_or_without_single_literal() {
+        // Комментарий.
+        assert!(kinds("// ПолучитьМакет(\"X\")").is_empty());
+        // Внутри строкового литерала — это текст, а не вызов.
+        assert!(extract_code_usages("С = \"ПолучитьМакет(\"\"X\"\")\";").is_empty());
+        // Аргумент — не один литерал: переменная, склейка, второй аргумент.
+        assert!(kinds("ПолучитьМакет(Имя)").is_empty());
+        assert!(kinds("ПолучитьМакет(\"X\" + Суффикс)").is_empty());
+        assert!(kinds("ПолучитьМакет(\"X\", Параметр)").is_empty());
+        // Не наш вызов, лишь похожее имя.
+        assert!(kinds("МойПолучитьМакет(\"X\")").is_empty());
+        // Пустой литерал и имя с пробелом — не идентификатор макета.
+        assert!(kinds("ПолучитьМакет(\"\")").is_empty());
+        assert!(kinds("ПолучитьМакет(\"Два слова\")").is_empty());
+    }
+
+    /// Метод-форма с менеджер-приёмником: владелец известен сразу (A1).
+    #[test]
+    fn template_call_via_manager_resolves_owner_from_receiver() {
+        let r = extract_code_usages("Схема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");");
+        // Строка даёт и `manager` (Справочники.Вакансии), и сам вызов макета.
+        let tpl: Vec<&CodeUsage> = r
+            .iter()
+            .filter(|u| u.usage_kind.starts_with("template"))
+            .collect();
+        assert_eq!(tpl.len(), 1, "{r:?}");
+        assert_eq!(tpl[0].usage_kind, "template_call_via_manager");
+        assert_eq!(tpl[0].object_ref, "Catalog.Вакансии");
+        assert_eq!(tpl[0].object_ref_key, "catalog.вакансии");
+        assert_eq!(tpl[0].member_path.as_deref(), Some("ПФ"));
+
+        // EN-коллекция в одну папку выгрузки.
+        let r = extract_code_usages("Схема = Catalogs.Вакансии.ПолучитьМакет(\"ПФ\");");
+        let tpl = r
+            .iter()
+            .find(|u| u.usage_kind.starts_with("template"))
+            .expect("метод-форма извлечена");
+        assert_eq!(tpl.object_ref, "Catalog.Вакансии");
+        assert_eq!(tpl.usage_kind, "template_call_via_manager");
+    }
+
+    /// Метод-форма с нераспознанным приёмником — непокрытая форма (A1/A2).
+    #[test]
+    fn template_call_via_receiver_is_counted_not_resolved() {
+        let r = extract_code_usages("Схема = ОбъектПеременная.ПолучитьМакет(\"Y\");");
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].usage_kind, "template_call_via_receiver");
+        assert_eq!(r[0].object_ref, "Template");
+        assert_eq!(r[0].object_ref_key, "template");
+        assert_eq!(r[0].member_path.as_deref(), Some("Y"));
+    }
+
+    /// `Метаданные.Справочники.X` — не вызов макета и не менеджер-приёмник.
+    #[test]
+    fn metadata_prefix_does_not_confuse_manager_receiver() {
+        // Обращение к метаданным без вызова макета: template-строк нет вовсе.
+        let r = extract_code_usages("Если Метаданные.Справочники.Вакансии.Существует() Тогда");
+        assert!(
+            r.iter().all(|u| !u.usage_kind.starts_with("template")),
+            "Метаданные.Справочники.X не должен давать вызов макета: {r:?}"
+        );
+        // Вызов через `Метаданные.Справочники.X`: первый идентификатор цепочки
+        // `Метаданные` не менеджер → владелец НЕ приписывается (непокрытая форма).
+        let r = extract_code_usages("С = Метаданные.Справочники.Вакансии.ПолучитьМакет(\"Y\");");
+        let tpl: Vec<&CodeUsage> = r
+            .iter()
+            .filter(|u| u.usage_kind.starts_with("template"))
+            .collect();
+        assert_eq!(tpl.len(), 1, "{r:?}");
+        assert_eq!(tpl[0].usage_kind, "template_call_via_receiver");
+    }
+
+    #[test]
+    fn template_call_marker_does_not_break_neighbour_usages() {
+        // Маркер литерала не должен ломать соседние извлечения на той же строке.
+        let r = extract_code_usages(
+            "Док = Документы.Заказ.СоздатьДокумент(); Схема = ПолучитьМакет(\"Макет1\");",
+        );
+        let kinds_got: Vec<&str> = r.iter().map(|u| u.usage_kind).collect();
+        assert!(kinds_got.contains(&"manager"), "{r:?}");
+        assert!(kinds_got.contains(&"template_call"), "{r:?}");
+    }
+
+    #[test]
+    fn template_call_line_number_is_physical() {
+        let src = "А = 1;\n\nБ = ПолучитьМакет(\"Макет\");";
+        let r = extract_code_usages(src);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].line, 3);
+    }
+
+    /// Выравнивание маркеров и `strings` на строке с продолжением
+    /// многострочного литерала (маркер продолжения идёт в начале строки).
+    #[test]
+    fn template_call_after_multiline_string_matches_its_own_literal() {
+        let src = "Текст = \"начало\nпродолжение\"; Схема = ПолучитьМакет(\"Цель\");";
+        let r = extract_code_usages(src);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].usage_kind, "template_call");
+        assert_eq!(r[0].member_path.as_deref(), Some("Цель"));
+        assert_eq!(r[0].line, 2);
     }
 }
