@@ -1735,6 +1735,183 @@ fn call_graph_combines_subscriptions_and_form_events() {
     assert!(map.get("direct").copied().unwrap_or(0) == 0);
 }
 
+/// Этап 4f: у не-direct слоёв появляется адрес цели. До него `callee_proc_key`
+/// был пуст у ВСЕХ рёбер подписок, событий форм и перехватов — из-за этого
+/// `get_callers` по обработчику подписки отвечал «вызывающих нет», а
+/// `find_path_bsl` не мог пройти сквозь платформенную точку входа.
+#[test]
+fn non_direct_edges_get_callee_address() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    // Обработчик подписки живёт в общем модуле.
+    write(
+        &repo
+            .join("CommonModules")
+            .join("М")
+            .join("Ext")
+            .join("Module.bsl"),
+        "Процедура П() Экспорт\nКонецПроцедуры\n",
+    );
+    write(
+        &repo.join("EventSubscriptions").join("Sub.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject>
+  <EventSubscription>
+<Properties>
+  <Name>Sub</Name>
+  <Source><Type><v8:Type>cfg:DocumentRef.X</v8:Type></Type></Source>
+  <Event>ПриЗаписи</Event>
+  <Handler>М.П</Handler>
+</Properties>
+  </EventSubscription>
+</MetaDataObject>"#,
+    );
+    // Обработчик формы живёт в модуле формы.
+    write(
+        &repo
+            .join("Documents")
+            .join("X")
+            .join("Forms")
+            .join("Ф")
+            .join("Ext")
+            .join("Form.xml"),
+        r#"<?xml version="1.0"?>
+<Form><Events>
+  <Event name="ПриОткрытии">ПриОткрытии</Event>
+</Events></Form>"#,
+    );
+    write(
+        &repo
+            .join("Documents")
+            .join("X")
+            .join("Forms")
+            .join("Ф")
+            .join("Ext")
+            .join("Form")
+            .join("Module.bsl"),
+        "Процедура ПриОткрытии()\nКонецПроцедуры\n",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+
+    // Ядро в юнит-тесте надстройки не запускается: `files`, `functions` и
+    // `metadata_modules` наполняет индексатор ядра. Кладём их прямо — так
+    // проверяется именно резолвер адресов, а не разбор .bsl (он покрыт тестами
+    // ядра). Пути и имена — как в боевой раскладке выгрузки.
+    conn.execute_batch(
+        "INSERT INTO files (id, path, content_hash, language, lines_total) VALUES
+             (1, 'CommonModules/М/Ext/Module.bsl', 'h1', 'bsl', 3),
+             (2, 'Documents/X/Forms/Ф/Ext/Form/Module.bsl', 'h2', 'bsl', 3);
+         INSERT INTO functions (file_id, name, line_start, line_end) VALUES
+             (1, 'П', 1, 3),
+             (2, 'ПриОткрытии', 1, 3);
+         INSERT INTO metadata_modules
+             (repo, full_name, object_name, module_type, object_id, property_id, code_path) VALUES
+             ('default', 'CommonModules.М.Module', 'CommonModules.М', 'Module', 'u1', 'p1',
+              'CommonModules/М/Ext/Module.bsl'),
+             ('default', 'Documents.X.Form.Ф.FormModule', 'Documents.X.Form.Ф', 'FormModule', 'u2', 'p2',
+              'Documents/X/Forms/Ф/Ext/Form/Module.bsl');",
+    )
+    .unwrap();
+
+    // Пересборка слоёв — тот же путь, что и в бою: вставка рёбер, затем резолв.
+    call_graph::rebuild_call_graph_subscription(conn).unwrap();
+    call_graph::rebuild_call_graph_form_event(conn).unwrap();
+
+    let sub_key: Option<String> = conn
+        .query_row(
+            "SELECT callee_proc_key FROM proc_call_graph WHERE call_type = 'subscription'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sub_key.as_deref(),
+        Some("CommonModules/М/Ext/Module.bsl::П"),
+        "обработчик подписки обязан получить адрес в общем модуле"
+    );
+
+    let form_key: Option<String> = conn
+        .query_row(
+            "SELECT callee_proc_key FROM proc_call_graph WHERE call_type = 'form_event'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        form_key.as_deref(),
+        Some("Documents/X/Forms/Ф/Ext/Form/Module.bsl::ПриОткрытии"),
+        "обработчик формы обязан получить адрес в модуле формы"
+    );
+}
+
+/// Регрессия, найденная приёмкой на живой базе: **повторная** точечная
+/// индексация одного и того же файла падала на UNIQUE-ключе графа
+/// (`proc_call_graph.repo, caller_proc_key, callee_proc_name, call_type`).
+///
+/// Механика: пофайловая очистка снимала ребро только как `direct`, рядом
+/// оставалась пометка `platform` от предыдущего прохода, а классификация
+/// платформенных вызовов переводит `direct` в `platform` и упирается в уже
+/// существующую строку. Первый проход проходит, второй — падает, поэтому тест
+/// делает ровно два прохода и проверяет, что ребро осталось одно.
+#[test]
+fn repeated_incremental_update_keeps_platform_edge_single() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let rel = "CommonModules/М/Ext/Module.bsl";
+    let module = repo
+        .join("CommonModules")
+        .join("М")
+        .join("Ext")
+        .join("Module.bsl");
+    write(
+        &module,
+        "Процедура П()\n    Сообщить(Число(\"1\"));\nКонецПроцедуры\n",
+    );
+
+    let storage = fresh_storage(&tmp);
+    let conn = storage.conn();
+    // Ядро в этом тесте не запускается: строки `files`/`functions`/`calls`
+    // кладём прямо — проверяется только пофайловая ветка надстройки.
+    conn.execute_batch(
+        "INSERT INTO files (id, path, content_hash, language, lines_total) VALUES
+             (1, 'CommonModules/М/Ext/Module.bsl', 'h', 'bsl', 3);
+         INSERT INTO functions (file_id, name, line_start, line_end) VALUES
+             (1, 'П', 1, 3);
+         INSERT INTO calls (file_id, caller, callee, line) VALUES
+             (1, 'П', 'Число', 2);",
+    )
+    .unwrap();
+
+    let paths = vec![rel.to_string()];
+    for pass in 1..=2 {
+        call_graph::create_batch_scope(conn, &paths).unwrap();
+        call_graph::update_call_graph_direct_for_file(&repo, conn, &module).unwrap();
+        call_graph::resolve_and_prune_direct_edges(
+            conn,
+            call_graph::EdgeScope::Batch,
+            "proc_call_graph",
+        )
+        .unwrap_or_else(|e| panic!("проход {pass} упал: {e}"));
+    }
+
+    let rows: Vec<(String, String, Option<String>)> = conn
+        .prepare("SELECT call_type, callee_proc_name, callee_proc_key FROM proc_call_graph")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "ребро должно остаться одно: {rows:?}");
+    assert_eq!(
+        rows[0].0, "platform",
+        "вызов глобальной функции платформы помечен классом platform"
+    );
+    assert!(rows[0].2.is_none(), "адреса у платформенного вызова нет");
+}
+
 #[test]
 fn fills_metadata_forms_from_dump_layout() {
     let tmp = TempDir::new().unwrap();

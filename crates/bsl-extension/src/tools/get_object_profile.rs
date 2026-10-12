@@ -435,7 +435,16 @@ fn assemble_profile(
 
     // ── Связи данных (data_links, singular key) ── только если запрошены ───
     let data_links = if want_links {
-        query_data_links(conn, full_name)?
+        let mut dl = query_data_links(conn, full_name)?;
+        // Каналы обращений — рядом со связями: вопрос «на что ссылается и кто
+        // ссылается» неотделим от вопроса «а все ли каналы ссылок собраны».
+        if let Some(obj) = dl.as_object_mut() {
+            obj.insert(
+                "usage_channels".into(),
+                query_usage_channels(conn, full_name, folder.as_deref(), name)?,
+            );
+        }
+        dl
     } else {
         Value::Null
     };
@@ -573,6 +582,77 @@ fn assemble_profile(
             }),
         }),
     ))
+}
+
+/// Каналы обращений к объекту: откуда индекс вообще узнаёт, что на объект
+/// ссылаются.
+///
+/// Нужна не для полноты, а для честности ответа: «ссылок нет» бывает следствием
+/// того, что канал не собран, а не того, что объект не используется. Самый
+/// показательный случай — макеты: обращения к ним лежат в строковом литерале
+/// (`ПолучитьМакет("X")`), и до появления этого канала больше тысячи макетов
+/// выглядели неиспользуемыми.
+///
+/// `platform_entry_points` — рёбра, у которых вызыватель синтетический (событие
+/// формы, подписка, перехват расширения): в таблице `calls` их нет по
+/// определению, и без этого счётчика «объект никто не дёргает» выглядело
+/// правдой при живых подписках на его события.
+fn query_usage_channels(
+    conn: &rusqlite::Connection,
+    object: &str,
+    folder: Option<&str>,
+    name: &str,
+) -> rusqlite::Result<Value> {
+    let mut code_by_kind = serde_json::Map::new();
+    let mut code_total: i64 = 0;
+    {
+        // Макеты объекта записаны вложенной ссылкой (`<объект>.Template.<имя>`),
+        // поэтому одного равенства мало.
+        let mut stmt = conn.prepare(
+            "SELECT usage_kind, COUNT(*) FROM metadata_code_usages \
+             WHERE repo = ?1 AND (object_ref = ?2 OR object_ref LIKE ?2 || '.Template.%') \
+             GROUP BY usage_kind ORDER BY 2 DESC, 1",
+        )?;
+        let rows = stmt.query_map(params![REPO, object], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for (kind, n) in rows.flatten() {
+            code_total += n;
+            code_by_kind.insert(kind, json!(n));
+        }
+    }
+
+    let mut entry_points = serde_json::Map::new();
+    if let Some(fld) = folder {
+        // Модули объекта в `metadata_modules` записаны именем папки выгрузки
+        // (множественная форма), формы — тем же именем с `.Form.<форма>`.
+        let owner = format!("{fld}.{name}");
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT c.call_type, COUNT(*) FROM proc_call_graph c \
+             WHERE c.call_type <> 'direct' AND c.callee_proc_key IN ( \
+                 SELECT fl.path || '::' || fn.name FROM metadata_modules mm \
+                 JOIN files fl ON fl.path = mm.code_path \
+                 JOIN functions fn ON fn.file_id = fl.id \
+                 WHERE mm.repo = ?1 \
+                   AND (mm.object_name = ?2 OR mm.object_name LIKE ?2 || '.Form.%')) \
+             GROUP BY c.call_type ORDER BY 2 DESC, 1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![REPO, &owner], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (kind, n) in rows.flatten() {
+                    entry_points.insert(kind, json!(n));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "code_by_kind": Value::Object(code_by_kind),
+        "code_total": code_total,
+        "platform_entry_points": Value::Object(entry_points),
+        "note": "Пустой канал не доказывает неиспользование: обращения к макетам лежат в строковых литералах, точки входа платформы — вне таблицы calls.",
+    }))
 }
 
 /// Формы объекта: имя + распарсенный список обработчиков.

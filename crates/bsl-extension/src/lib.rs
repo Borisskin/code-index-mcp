@@ -14,11 +14,14 @@
 // распространяются вместе с проектом (полный функционал открыт).
 
 pub mod code_usages;
+pub mod declarative_bindings;
 pub mod enrichment;
 pub mod form_bindings;
 pub mod index_extras;
 pub mod module_constants;
 pub mod parse_collector;
+pub(crate) mod platform_conventions;
+pub(crate) mod platform_globals;
 pub mod processor;
 pub mod qualified_callers;
 pub mod schema;

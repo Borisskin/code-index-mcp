@@ -80,26 +80,23 @@ pub(crate) fn update_call_graph_direct_for_file(
         }
     }
 
-    use std::collections::HashSet;
-    let new_set: HashSet<&(String, String)> = new.iter().collect();
-
-    // Рёбра, которые файл перестал давать → удалить из графа. Ключ теперь
-    // привязан к файлу (`<rel>::<caller>`), поэтому ребро принадлежит ровно
-    // этому файлу и не делится с другими — удаляем безусловно, как только
-    // файл его больше не даёт. Прежняя глобальная проверка по `calls` (нужная
-    // для голых ключей, чтобы не снести ребро, которое даёт другой файл) стала
-    // не только лишней, но и неверной: при path-привязке она удержала бы
-    // мёртвое ребро файла, если одноимённую пару даёт другой модуль.
+    // Рёбра файла снимаются ЦЕЛИКОМ — и `direct`, и `platform`; затем текущие
+    // рёбра файла вставляются заново как `direct`. Ключ вызывателя привязан к
+    // файлу (`<rel>::<caller>`), поэтому ребро принадлежит ровно этому файлу и
+    // удаляется безусловно: прежняя проверка «файл всё ещё даёт это ребро»
+    // (нужная для голых ключей, чтобы не снести ребро другого модуля) при
+    // path-привязке не только лишняя, но и неверная — она удержала бы мёртвое
+    // ребро файла, если одноимённую пару даёт другой модуль. И, что важнее,
+    // она оставляла прежнюю пометку `platform` рядом со свежим `direct`, а
+    // классификация переводит `direct` в `platform` и упирается в UNIQUE по
+    // (caller, callee, call_type) — точечное обновление надстройки падало.
     {
         let mut del = conn.prepare(
             "DELETE FROM proc_call_graph \
-             WHERE repo = ?1 AND call_type = 'direct' \
-               AND caller_proc_key = ?2 AND callee_proc_name = ?3",
+             WHERE repo = ?1 AND caller_proc_key = ?2 AND callee_proc_name = ?3 \
+               AND call_type IN ('direct', 'platform')",
         )?;
         for e in &old {
-            if new_set.contains(e) {
-                continue;
-            }
             let caller_key = format!("{}::{}", rel, e.0);
             del.execute(params![REPO_DEFAULT, caller_key, &e.1])?;
         }
@@ -154,6 +151,7 @@ pub(crate) fn rebuild_call_graph_subscription(conn: &rusqlite::Connection) -> Re
          WHERE repo = ? AND handler_module != '' AND handler_proc != ''",
         params![REPO_DEFAULT, REPO_DEFAULT],
     )?;
+    resolve_subscription_keys(conn)?;
     conn.execute("COMMIT", [])?;
     tracing::debug!("proc_call_graph subscription (slice-rebuild): {} рёбер", n);
     Ok(())
@@ -204,6 +202,7 @@ pub(crate) fn rebuild_call_graph_form_event(conn: &rusqlite::Connection) -> Resu
             }
         }
     }
+    resolve_form_event_keys(conn)?;
     conn.execute("COMMIT", [])?;
     tracing::debug!(
         "proc_call_graph form_event (slice-rebuild): {} рёбер",
@@ -237,7 +236,140 @@ pub(crate) fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection)
         params![REPO_DEFAULT, "extension_override"],
     )?;
     conn.execute(EXTENSION_OVERRIDE_INSERT_SQL, params![REPO_DEFAULT])?;
+    resolve_extension_override_keys(conn)?;
     conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Этап 4f для слоя `form_event`: адрес обработчика — процедура модуля формы.
+///
+/// Синтетический `callee_proc_name` этого слоя — `<владелец>::<форма>::<обработчик>`,
+/// а модуль формы лежит в `metadata_modules` под `object_name =
+/// '<владелец>.Form.<форма>'`. Карта строится один раз во временной таблице:
+/// поштучный разбор строки на три части в SQL был бы и нечитаем, и дорог.
+///
+/// Правило «пустой адрес лучше ложного»: если имени в файле соответствует
+/// больше одной процедуры, ребро остаётся без адреса.
+fn resolve_form_event_keys(conn: &rusqlite::Connection) -> Result<()> {
+    let t = std::time::Instant::now();
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS tmp_nd_form;
+        CREATE TEMP TABLE tmp_nd_form AS
+        SELECT callee_name, MIN(callee_key) AS callee_key FROM (
+            SELECT substr(mm.object_name, 1, instr(mm.object_name, '.Form.') - 1) || '::' ||
+                   substr(mm.object_name, instr(mm.object_name, '.Form.') + 6) || '::' || fn.name AS callee_name,
+                   fl.path || '::' || fn.name AS callee_key
+            FROM metadata_modules mm
+            JOIN files fl ON fl.path = mm.code_path
+            JOIN functions fn ON fn.file_id = fl.id
+            WHERE mm.module_type = 'FormModule'
+              AND instr(mm.object_name, '.Form.') > 0
+              AND fn.name IS NOT NULL AND fn.name != ''
+        ) GROUP BY callee_name HAVING COUNT(DISTINCT callee_key) = 1;
+        CREATE INDEX IF NOT EXISTS tmp_nd_form_idx ON tmp_nd_form(callee_name);
+        UPDATE proc_call_graph
+        SET callee_proc_key = (
+            SELECT k.callee_key FROM tmp_nd_form k
+            WHERE k.callee_name = proc_call_graph.callee_proc_name LIMIT 1)
+        WHERE call_type = 'form_event' AND callee_proc_key IS NULL;
+        DROP TABLE IF EXISTS tmp_nd_form;
+        "#,
+    )?;
+    tracing::debug!("резолв form_event: {} мс", t.elapsed().as_millis());
+    Ok(())
+}
+
+/// Этап 4f для слоя `subscription`: адрес обработчика — процедура общего модуля.
+///
+/// Источник адреса — сама строка подписки (`handler_module` + `handler_proc`).
+/// Имя модуля приходится приводить: в подписке оно записано как
+/// `CommonModule.Имя` (модуль общего назначения) либо, если обработчик лежит
+/// в модуле объекта/менеджера, вообще без префикса; в `metadata_modules` общий
+/// модуль значится как `CommonModules.Имя`. Поэтому префикс снимается, а не
+/// подставляется вслепую: без этого ветка с префиксом не находила модуль.
+fn resolve_subscription_keys(conn: &rusqlite::Connection) -> Result<()> {
+    let t = std::time::Instant::now();
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS tmp_nd_sub;
+        CREATE TEMP TABLE tmp_nd_sub AS
+        SELECT caller_key, callee_name, MIN(callee_key) AS callee_key FROM (
+            SELECT 'event::' || s.event                      AS caller_key,
+                   s.handler_module || '.' || s.handler_proc AS callee_name,
+                   fl.path || '::' || fn.name                AS callee_key
+            FROM event_subscriptions s
+            JOIN metadata_modules mm
+              ON mm.module_type = 'Module'
+             AND mm.object_name = 'CommonModules.' ||
+                 CASE WHEN s.handler_module LIKE 'CommonModule.%'
+                      THEN substr(s.handler_module, length('CommonModule.') + 1)
+                      ELSE s.handler_module END
+            JOIN files fl ON fl.path = mm.code_path
+            JOIN functions fn ON fn.file_id = fl.id AND fn.name = s.handler_proc
+        ) GROUP BY caller_key, callee_name HAVING COUNT(DISTINCT callee_key) = 1;
+        CREATE INDEX IF NOT EXISTS tmp_nd_sub_idx ON tmp_nd_sub(caller_key, callee_name);
+        UPDATE proc_call_graph
+        SET callee_proc_key = (
+            SELECT k.callee_key FROM tmp_nd_sub k
+            WHERE k.caller_key = proc_call_graph.caller_proc_key
+              AND k.callee_name = proc_call_graph.callee_proc_name LIMIT 1)
+        WHERE call_type = 'subscription' AND callee_proc_key IS NULL;
+        DROP TABLE IF EXISTS tmp_nd_sub;
+        "#,
+    )?;
+    tracing::debug!("резолв subscription: {} мс", t.elapsed().as_millis());
+    Ok(())
+}
+
+/// Этап 4f для слоя `extension_override`: адрес перехватчика.
+///
+/// Адрес перехватчика однозначен по построению — ребро и берётся из строки
+/// `functions` с непустым `override_type`. Группировка с `HAVING` нужна на
+/// случай одноимённых перехватчиков в разных расширениях: там адрес не
+/// выводится, и ребро остаётся без него.
+fn resolve_extension_override_keys(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS tmp_nd_ovr;
+        CREATE TEMP TABLE tmp_nd_ovr AS
+        SELECT f.name AS callee_name, MIN(fl.path || '::' || f.name) AS callee_key
+        FROM functions f
+        JOIN files fl ON fl.id = f.file_id
+        WHERE f.override_type IS NOT NULL AND f.name IS NOT NULL AND f.name != ''
+        GROUP BY f.name HAVING COUNT(DISTINCT fl.path || '::' || f.name) = 1;
+        CREATE INDEX IF NOT EXISTS tmp_nd_ovr_idx ON tmp_nd_ovr(callee_name);
+        UPDATE proc_call_graph
+        SET callee_proc_key = (
+            SELECT k.callee_key FROM tmp_nd_ovr k
+            WHERE k.callee_name = proc_call_graph.callee_proc_name LIMIT 1)
+        WHERE call_type = 'extension_override' AND callee_proc_key IS NULL;
+        DROP TABLE IF EXISTS tmp_nd_ovr;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Этап 4f целиком: адресовать все не-direct слои графа. Вызывается полным
+/// пересбором; точечный пересбор слоя зовёт только свою часть.
+pub(crate) fn resolve_non_direct_callee_keys(conn: &rusqlite::Connection) -> Result<()> {
+    let t = std::time::Instant::now();
+    resolve_form_event_keys(conn)?;
+    resolve_subscription_keys(conn)?;
+    resolve_extension_override_keys(conn)?;
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proc_call_graph \
+             WHERE call_type <> 'direct' AND callee_proc_key IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    tracing::debug!(
+        "резолв не-direct слоёв: {} мс, осталось без адреса {}",
+        t.elapsed().as_millis(),
+        left
+    );
     Ok(())
 }
 
@@ -447,6 +579,17 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         params![REPO_DEFAULT],
     )?;
 
+    // ── этап 4f: адреса не-direct слоёв ──────────────────────────────
+    // Три слоя выше собраны голыми именами (как `direct` до 4e); их адреса
+    // выводятся из данных, которые уже лежат в базе, — см. комментарии к
+    // `resolve_*_keys`. Правило то же: пустой адрес лучше ложного.
+    //
+    // Место выбрано намеренно ДО вставки direct-рёбер: в таблице сейчас только
+    // не-direct слои (десятки тысяч строк), а индексы графа на время полного
+    // пересбора сняты — после вставки миллиона direct-рёбер те же три UPDATE
+    // шли бы полным сканом по большой таблице.
+    resolve_non_direct_callee_keys(conn)?;
+
     // ── этап 4e + 4e-D + 4e-prune: резолв callee_proc_key + отсев балласта ──
     // Общий с инкрементом хелпер: run_incremental_extras зовёт его же ОДИН раз
     // после пофайловой вставки рёбер батча → идентичность full↔incremental.
@@ -501,8 +644,8 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         override_count
     );
 
-    // TODO(этап 4f): extension_override — резолв override_target/имени перехватчика
-    // в `<rel_path>::<name>` (сейчас голые имена, как direct до 4e).
+    // Этап 4f закрыт: `form_event`, `subscription` и `extension_override`
+    // получают адрес цели (`resolve_non_direct_callee_keys`).
     // TODO(этап 4g): external_assignment — runtime-анализ переменных
     // неопределённого типа. Опционально, очень дорогая фича.
 
@@ -553,6 +696,23 @@ pub(crate) fn resolve_and_prune_direct_edges(
     resolve_callee_keys_by_form_owner(conn, scope, edges)?;
     tracing::debug!(
         "резолв: вызовы из форм в модуль своего объекта — {} мс",
+        t.elapsed().as_millis()
+    );
+    // Регистронезависимый добор — последним из правил резолва: он берёт только
+    // то, что не взяли точные правила, и только при единственном кандидате.
+    let t = std::time::Instant::now();
+    resolve_case_insensitive_keys(conn, scope, edges)?;
+    tracing::debug!(
+        "резолв: регистронезависимый добор — {} мс",
+        t.elapsed().as_millis()
+    );
+    // Классификация — ПОСЛЕ резолва (адресуемые рёбра уже адресованы) и ДО
+    // отсева: отсев ищет балласт среди direct-рёбер, и платформенные вызовы
+    // ему не принадлежат — их место в графе сохраняется, меняется только класс.
+    let t = std::time::Instant::now();
+    classify_platform_calls(conn, scope, edges)?;
+    tracing::debug!(
+        "классификация платформенных вызовов — {} мс",
         t.elapsed().as_millis()
     );
     let t = std::time::Instant::now();
@@ -952,6 +1112,205 @@ pub(crate) const PLATFORM_BALAST: &[&str] = &[
     "ТаблицаЗначений",
     "СписокЗначений",
 ];
+
+/// Регистронезависимый резолв адресов — для BSL, где регистр имени не значим.
+///
+/// Точные правила резолвера сравнивают имена как строки, и этого мало: в 1С
+/// `Провести` и `провести` — одно и то же имя, а для базы это две разные строки.
+/// Свернуть регистр в SQL нельзя: `lower()` в SQLite не трогает кириллицу
+/// (проверено), поэтому карта «имя в нижнем регистре → адрес» собирается в Rust.
+///
+/// Правило «пустой адрес лучше ложного» соблюдается дважды: имя берётся только
+/// из числа уже неразрешённых, и адрес ставится, только если нижнему регистру
+/// имени соответствует РОВНО одно определение. Два модуля с процедурами,
+/// совпадающими с точностью до регистра, — уже неоднозначность, адрес не ставится.
+fn resolve_case_insensitive_keys(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    let names: Vec<String> = {
+        // Область резолва: на точечном проходе — только рёбра файлов пакета.
+        // Иначе каждый батч перебирал бы все неадресованные рёбра графа.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT callee_proc_name FROM {edges} \
+             WHERE call_type = 'direct' AND callee_proc_key IS NULL{}",
+            scope.clause()
+        ))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if names.is_empty() {
+        return Ok(());
+    }
+    let wanted: std::collections::HashSet<String> =
+        names.iter().map(|n| n.to_lowercase()).collect();
+
+    // Адрес по имени в нижнем регистре; `None` — имя неоднозначно.
+    let mut map: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT fn.name, fl.path FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+             WHERE fn.name IS NOT NULL AND fn.name != ''",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let lower = name.to_lowercase();
+            if !wanted.contains(&lower) {
+                continue;
+            }
+            let path: String = row.get(1)?;
+            let key = format!("{path}::{name}");
+            match map.get_mut(&lower) {
+                Some(slot) => {
+                    if slot.as_deref() != Some(key.as_str()) {
+                        *slot = None;
+                    }
+                }
+                None => {
+                    map.insert(lower, Some(key));
+                }
+            }
+        }
+    }
+    let pairs: Vec<(String, String)> = names
+        .iter()
+        .filter_map(|n| match map.get(&n.to_lowercase()) {
+            Some(Some(key)) => Some((n.clone(), key.clone())),
+            _ => None,
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_ci_pairs;
+         CREATE TEMP TABLE tmp_ci_pairs(callee TEXT PRIMARY KEY, key TEXT NOT NULL);",
+    )?;
+    {
+        let mut ins =
+            conn.prepare("INSERT OR IGNORE INTO tmp_ci_pairs(callee, key) VALUES (?1, ?2)")?;
+        for (callee, key) in &pairs {
+            ins.execute(params![callee, key])?;
+        }
+    }
+    let n = conn.execute(
+        &format!(
+            "UPDATE {edges} SET callee_proc_key = \
+                 (SELECT key FROM tmp_ci_pairs p WHERE p.callee = {edges}.callee_proc_name) \
+             WHERE call_type = 'direct' AND callee_proc_key IS NULL \
+               AND callee_proc_name IN (SELECT callee FROM tmp_ci_pairs){}",
+            scope.clause()
+        ),
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_ci_pairs;")?;
+    if n > 0 {
+        tracing::debug!(
+            "регистронезависимый резолв: адресовано {} рёбер по {} именам",
+            n,
+            pairs.len()
+        );
+    }
+    Ok(())
+}
+
+/// Отдельный класс для вызовов глобальных функций платформы.
+///
+/// Такие рёбра не «неразрешённые»: адреса в конфигурации у них нет по природе.
+/// На живой конфигурации это **80 % всех рёбер с пустым адресом** (`Число`,
+/// `Дата`, `ПоказатьВопрос`, `НРег`…), поэтому в статистике связывания они
+/// искажают картину сильнее всего.
+///
+/// Отдельный `call_type` нужен не только статистике: канал «прощение по имени»
+/// в анализе неиспользуемого кода считает процедуру живой, если её имя совпало с
+/// именем неразрешённого ребра. Совпадает оно чаще всего именно с платформенной
+/// функцией — то есть сегодня платформенный вызов «спасает» одноимённую
+/// процедуру пользователя.
+///
+/// Безопасность: имя уходит в платформенные ТОЛЬКО если в этой конфигурации у
+/// него нет ни одного определения. Иначе пользовательская `Функция Число(...)`
+/// потеряла бы входящие вызовы. Сравнение — по нижнему регистру и в Rust:
+/// `SQLite` не сворачивает кириллицу функцией `lower()`.
+fn classify_platform_calls(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // Область резолва та же, что у остальных проходов: на точечном обновлении —
+    // только рёбра файлов пакета.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT callee_proc_name FROM {edges} \
+         WHERE call_type = 'direct' AND callee_proc_key IS NULL{}",
+        scope.clause()
+    ))?;
+    let candidates: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let platform: std::collections::HashSet<String> =
+        crate::platform_globals::platform_globals_lower()
+            .into_iter()
+            .collect();
+    let matched: Vec<&String> = candidates
+        .iter()
+        .filter(|n| platform.contains(&n.to_lowercase()))
+        .collect();
+    if matched.is_empty() {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pf_names;
+         CREATE TEMP TABLE tmp_pf_names(name TEXT PRIMARY KEY);",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO tmp_pf_names(name) VALUES (?1)")?;
+        for n in &matched {
+            ins.execute(params![n])?;
+        }
+    }
+    // Страховка от прежней пометки. Если у ребра уже есть строка `platform`
+    // (осталась от прошлого прохода, пока файл ещё не переиндексировали), то
+    // UPDATE ниже упрётся в UNIQUE по (caller, callee, call_type) — именно так
+    // падало точечное обновление надстройки. Ребро одно и то же, две строки о
+    // нём противоречат друг другу: снимаем пометку, UPDATE поставит её заново.
+    conn.execute(
+        &format!(
+            "DELETE FROM {edges} WHERE call_type = 'platform' \
+               AND callee_proc_name IN (SELECT name FROM tmp_pf_names) \
+               AND (caller_proc_key, callee_proc_name) IN ( \
+                   SELECT caller_proc_key, callee_proc_name FROM {edges} \
+                   WHERE call_type = 'direct' AND callee_proc_key IS NULL{})",
+            scope.clause()
+        ),
+        [],
+    )?;
+    let n = conn.execute(
+        &format!(
+            "UPDATE {edges} SET call_type = 'platform' \
+             WHERE call_type = 'direct' AND callee_proc_key IS NULL \
+               AND callee_proc_name IN (SELECT name FROM tmp_pf_names) \
+               AND NOT EXISTS (SELECT 1 FROM functions f \
+                               WHERE f.name = {edges}.callee_proc_name){}",
+            scope.clause()
+        ),
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pf_names;")?;
+    if n > 0 {
+        tracing::debug!(
+            "платформенные вызовы выделены в отдельный класс: {} рёбер из {} имён",
+            n,
+            matched.len()
+        );
+    }
+    Ok(())
+}
 
 /// Один проход отсева NULL-рёбер `direct`: платформенный балласт + объектные
 /// вызовы.

@@ -1093,7 +1093,10 @@ pub(crate) fn update_code_usages_for_file(
     )?;
     if bsl_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(bsl_path) {
-            let usages = extract_code_usages(&content);
+            let usages = extract_code_usages(
+                &content,
+                crate::code_usages::owner_ref_from_path(&rel).as_deref(),
+            );
             if !usages.is_empty() {
                 let mut stmt = conn.prepare(
                     "INSERT INTO metadata_code_usages \
