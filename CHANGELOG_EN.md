@@ -5,6 +5,36 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.10.0] — 2026-10-12
+
+**Names bound to addresses: platform entry points stopped being invisible, calls to platform global functions stopped posing as unresolved code, and template references stopped getting lost.**
+
+### Added
+
+- **Addresses for platform call-graph edges.** Edges of type `form_event` (form event), `subscription` (event subscription) and `extension_override` (extension override) used to be collected without a target address: `callee_proc_key` was empty for every one of them — on a typical trade configuration that is 73,065 + 368 + 42 edges, i.e. 100 %. The address is derived from data already present in the index: the form module comes from `metadata_modules` (an entry of the form `<owner>.Form.<form>`), the subscription handler comes from the subscription row itself (the common-module name is normalised: `CommonModule.X` → `CommonModules.X`), the override comes from `functions.override_type`. The "empty address beats a false one" rule holds: where more than one procedure in a file bears the name, no address is written. This works both on a full rebuild and on an incremental update. After the rebuild, 2,561 form-event edges (3.5 %), one subscription and one override remain without an address.
+- **A separate `platform` edge class.** Calls to platform global functions (`ПоказатьВопрос`, `Число`, `СтрЧислоВхождений`, `НРег`, `НачалоДня`, …) no longer look like unresolved code: in a configuration they have no address by nature. Classification uses a list of 196 names and applies only when the configuration defines no procedure with that name — a user procedure carrying a platform name does not lose its incoming calls. On a typical trade configuration this is 470,415 edges, and the share of unaddressed code edges dropped from 13.3 % to 2.4 %.
+- **Declarative bindings in `get_callers` — no longer forms only.** Besides form event handlers, the tool now answers for subscriptions (listing the source objects) and for extension overrides in both directions: "this procedure overrides a base one" and "this procedure is overridden by an extension". A separate kind covers handlers the platform calls by naming convention: document posting and unposting, fill, write events, command handler, manager form choice. The module kind is derived from the file path, because the same name means different things in an object module and in a common module. Before this change `get_callers` answered "0 edges" for a subscription handler, and for a posting handler it returned name matches from unrelated modules while saying nothing about the platform.
+- **A reference channel for templates and common pictures.** `ПолучитьМакет("X")` inside an object module now yields a reference to that object's template; the owner comes from the module path, and for a call with a receiver (`Справочники.X.ПолучитьМакет(...)`) from the receiver. `ПолучитьОбщийМакет("X")` and `БиблиотекаКартинок.X` are recorded as separate kinds. The argument is taken only as a literal immediately inside the parentheses: a call with a variable and a commented-out call produce no link — a false link is worse than a miss, because the template would look used. Before the change, code references to templates did not exist at all (0 of 14,491); now there are 2,596 to 1,985 templates, plus 6,884 references to 825 common pictures and 196 to 118 common templates.
+- **`usage_channels` section in `get_object_profile`.** Next to the data links in an object's passport: how many references came from code and through which channels, and how many platform entry points lead into the object's modules. It exists so that "no references" is not confused with "the channel was not collected".
+
+### Changed
+
+- **Case-insensitive address resolution.** In 1C `Провести` and `провести` are the same name, while for the database they are different strings (SQLite's `lower()` does not fold Cyrillic). The "lowercase name → address" map is built in Rust, and an address is written only for a single candidate.
+- **Data version raised to 2.** The table schema did not change, but the composition of the graph did: a version 1 database still reads, yet answers from it will be the old ones. The tools report the mismatch themselves (`stale_index`) and name the rebuild command.
+
+### Compatibility
+
+- **A one-off full pass is required:** `bsl-indexer index <path> --force`. Without it the graph stays as before — with "no callers" where a binding exists.
+- The table schema did not change; rolling back to the previous version does not require a rebuild.
+
+### Verification
+
+- **Gates:** `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings` — clean; `cargo test --workspace --all-targets` — 0 failures.
+- **Full rebuild of the test configuration** (a typical accounting configuration with extensions, 88,284 files): 226 s in total — core 103 s, extras 110 s (of which the call graph took 72 s), disk flush 13 s. Resulting graph: 1,629,697 edges.
+- **Layers after the rebuild:** `direct` 1,082,114 (25,986 without an address, i.e. 2.4 %), `platform` 470,415, `form_event` 73,065 (2,561 without an address, 3.5 %), `subscription` 368 (1 without an address), `extension_override` 42 (1 without an address).
+- **Live smoke.** A subscription handler: used to be "0 edges" — now it returns a `subscription` edge listing 40 source objects. A posting handler: name matches are now accompanied by "the platform calls this by convention: document posting" records with module paths. An object passport: `usage_channels` reports 1,042 code references by kind and 501 form events as entry points into the object's modules.
+- **Incremental reindex (a check over 100 files).** A trailing space was appended to every file (30 object modules containing template calls and 70 document modules); the daemon processed them in 11.4 s, extras in 7.0 s. The first run of this check found a defect: a repeated per-file index pass failed on the graph's UNIQUE key — the per-file cleanup removed an edge only as `direct`, while the `platform` mark from the previous pass remained, so the extras update ended with the warning "the extras layer was not rebuilt". Fixed: the cleanup now removes the file's edges entirely, and the classifier additionally guards against a stale mark; on the fixed version the run was repeated clean, and the regression is covered by a test performing two consecutive passes over the same file.
+
 ## [1.9.0] — 2026-10-12
 
 **Posting mechanism map: `posting_map` shows where movements are formed and separates actual writes from register mentions.**
