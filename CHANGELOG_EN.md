@@ -5,6 +5,33 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.9.0] — 2026-10-12
+
+**Posting mechanism map: `posting_map` shows where movements are formed and separates actual writes from register mentions.**
+
+### Added
+
+- **BSL tool `posting_map` (the 34th tool).** For a document (`Document.SalesInvoice`) it answers "how are this document's movements formed and where in the code does that happen", joining four layers of the index: `declared` — registers of the declarative movement set (recorder edges of `data_links`); `path` — files and procedures reachable from the posting handler over the call graph (`depth` 1..6); `writes` — actual movement writes; `mentions` — where the declared registers occur in code (`metadata_code_usages`).
+- **The `writes` layer is built from call names, not from mentions.** `Движения.<Register>.Добавить` / `.Записать` are stored in the `calls` table as whole call names, so the register name needs no guessing. Every row carries the procedure (by the `functions.line_start..line_end` range), the file, the line and `level`: `register` for an action on a specific register, `collection` for one on the whole movement collection (`Движения.Записать` is flagged `whole_set`; `Движения.Добавить` adds a set by name, the name living in the call argument and being statically unavailable). Reads and lookups (`.Найти`, `.Количество`, set properties) never enter the layer.
+- **The layers never mix: a mention is not a write.** `registers_without_code` lists declared registers absent from both writes and mentions — their movements are formed by a generic mechanism by metadata name.
+
+### Changed
+
+- **The module-type filter now applies to the mentions layer only.** Previously the manager module was excluded from the map entirely — along with balance-query noise, real movement writes were lost. Measured on a live configuration, 72% of movement writes live in common modules of accounting subsystems (803 calls versus 184 in object modules and 131 in manager modules), yet for documents such as opening-balance entry and register adjustments the posting code sits exactly in the manager module. `include_manager_module` now controls the `mentions` layer only, while `writes` is always visible in the manager module.
+- **The tool works without a posting handler.** When `ОбработкаПроведения` is found neither in the object module nor in the manager module, the response carries `heuristic=true` and `scope="heuristic"`: the graph constraint is dropped (forms and overridable modules are excluded from the selection) while the writes layer keeps working — writes are visible without the graph. A similarly named procedure is never substituted as the entry point (on a scheduled operation that substitution produced a map of two files and zero writes while 97 registers were declared, yet the answer looked precise); it stays a hint in `warnings`.
+
+### Compatibility
+
+- The database schema is unchanged and no reindex is required: the tool reads the already-built `data_links`, `proc_call_graph`, `metadata_code_usages`, `calls`, `functions`, `files`, `metadata_modules`.
+- Existing tools are untouched: `get_register_writers` still returns only the declarative movement set, and `find_references` returns code usages without procedure names and without separating reads from writes.
+
+### Verification
+
+- **Gates:** `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings` — clean; `cargo test --workspace --all-targets` — 0 failures. Eight new tests: call-name parsing (register/collection, reads and set properties filtered out), attribution of a write to its procedure and register, ignoring foreign registers, keeping the manager module in `writes` while dropping it from `mentions`, collection-level calls, forms being outside the call-graph scope, the composition of `registers_without_code`, and falling back to heuristic mode when no posting handler exists.
+- **Live smoke on a local database (88,284 files, the same index the production `serve` uses).** A goods-receipt document (56 declared registers): an entry point in the object module, 87 files and 626 procedures reachable, 200 write rows (all in common modules of accounting subsystems) in 1.8 s. An opening-balance document (54 registers): two writes from the manager module are visible in `writes`, and not a single row from it in `mentions`. A document whose manager module both writes movements and mentions registers: with `include_manager_module=true` mentions go 50 → 72, 18 of them from the manager module, while the writes layer is unchanged (52 either way).
+- **A defect found by the smoke and fixed before release.** A scheduled operation (97 declared registers) used to take a similarly named manager-module procedure as its entry point and return a map of two files and zero writes under `scope = call_graph` — an answer that looked precise while being wrong. That procedure is now a hint in `warnings` only, and the tool goes `heuristic = true`: 200 write rows, 7 of them in the manager module.
+- **Edge case:** a non-document object (`Catalog.Организации`) — `declared = 0`, empty layers, two clear warnings, no error.
+
 ## [1.8.6] — 2026-10-08
 
 **`serve` over HTTP admits clients by network address: `/mcp` no longer rejects a foreign `Host`.**
