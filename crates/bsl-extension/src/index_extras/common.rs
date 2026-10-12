@@ -1,7 +1,9 @@
 //! Общие части слоя надстройки: состав разбираемых папок, разбор путей
 //! объектов, корни областей выгрузки, обслуживание статистики планировщика.
 
-use crate::xml::object_attributes::{parse_object_structure_file, ObjectStructure};
+use crate::xml::object_attributes::{
+    parse_object_belonging, parse_object_structure_file, ObjectStructure,
+};
 use anyhow::Result;
 use rusqlite::params;
 use std::path::Path;
@@ -376,6 +378,50 @@ pub(crate) fn compute_extension_name(repo_root: &Path, sub_root: &Path) -> Strin
         return String::new();
     }
     s
+}
+
+/// Владелец объекта (`metadata_objects.sub_config`) по фактическим копиям
+/// объекта во ВСЕХ sub-config'ах (base-first). Тем же правилом, что пофайловый
+/// `upsert_metadata_object`: копия в базовой области, копия с
+/// `ObjectBelonging=Adopted` либо без тега → владелец база (`''`); собственный
+/// (`Native`) объект расширения → путь области-расширения. Нужен полному
+/// проходу (`index_metadata_objects`), который иначе писал бы `sub_config=''`
+/// всем подряд (расхождение с инкрементом).
+///
+/// `folder` — папка выгрузки объекта (`Catalogs`), `stem` — имя файла без
+/// `.xml`. Отсутствие копий на диске → `''` (строка перечня без владельца).
+pub(crate) fn object_sub_config(
+    repo_root: &Path,
+    roots: &[std::path::PathBuf],
+    folder: &str,
+    stem: &str,
+) -> String {
+    let mut owner = String::new();
+    let mut owner_is_base = false;
+    for sub_root in roots {
+        if owner_is_base {
+            break;
+        }
+        let cand = sub_root.join(folder).join(format!("{}.xml", stem));
+        if !cand.is_file() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&cand) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let ext_name = compute_extension_name(repo_root, sub_root);
+        let belonging = parse_object_belonging(&content);
+        if ext_name.is_empty() || belonging.as_deref() != Some("Native") {
+            // base-root, либо Adopted, либо тега нет → владелец база.
+            owner = String::new();
+            owner_is_base = true;
+        } else {
+            // Native в расширении.
+            owner = ext_name;
+        }
+    }
+    owner
 }
 
 /// Число строк в таблице, записанное в `sqlite_stat1` на момент последнего

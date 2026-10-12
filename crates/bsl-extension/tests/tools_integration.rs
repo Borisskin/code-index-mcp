@@ -13,6 +13,7 @@
 // все эти типы из-за приватных полей и Mutex<Storage>.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
@@ -1456,7 +1457,10 @@ async fn find_unreferenced_objects_stale_index_returns_no_numbers() {
     .await;
 
     assert_eq!(res["stale"].as_bool(), Some(true), "{res}");
-    assert!(res["results"].is_null(), "при stale числа не отдаются: {res}");
+    assert!(
+        res["results"].is_null(),
+        "при stale числа не отдаются: {res}"
+    );
     assert!(res["results_total"].is_null(), "{res}");
     assert!(res["hint"]
         .as_str()
@@ -1511,7 +1515,7 @@ async fn find_unreferenced_objects_reports_channels_and_paginates() {
     )
     .await;
 
-    assert_eq!(res["formula_version"].as_str(), Some("c2-v1"));
+    assert_eq!(res["formula_version"].as_str(), Some("c2-v3"));
     assert!(
         res["channels_applied"]["template_paths"]
             .as_u64()
@@ -1606,7 +1610,10 @@ async fn find_unreferenced_objects_meta_type_normalizes_russian() {
     )
     .await;
     assert_eq!(res["results_total"].as_u64(), Some(1), "{res}");
-    assert_eq!(res["results"][0]["full_name"].as_str(), Some("Catalog.Нигде"));
+    assert_eq!(
+        res["results"][0]["full_name"].as_str(),
+        Some("Catalog.Нигде")
+    );
     assert!(
         res["not_addressable"].as_object().unwrap().is_empty(),
         "Subsystem вне фильтра Catalog не считается: {res}"
@@ -1685,7 +1692,8 @@ async fn find_unreferenced_objects_reports_channels_not_applied() {
 async fn find_unreferenced_objects_end_to_end_manager_template_call() {
     let (_tmp, storage) = fresh_storage();
     mark_index_current(&storage).await;
-    let src = "Процедура П()\n\tСхема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");\nКонецПроцедуры";
+    let src =
+        "Процедура П()\n\tСхема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");\nКонецПроцедуры";
     let usages = bsl_extension::code_usages::extract_code_usages(src);
     assert!(
         usages
@@ -1715,7 +1723,13 @@ async fn find_unreferenced_objects_end_to_end_manager_template_call() {
                 "INSERT INTO metadata_code_usages \
                  (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
                  VALUES ('default', ?1, ?2, ?3, ?4, 'Catalogs/Вакансии/Ext/ManagerModule.bsl', ?5)",
-                params![u.object_ref, u.object_ref_key, u.member_path, u.usage_kind, u.line as i64],
+                params![
+                    u.object_ref,
+                    u.object_ref_key,
+                    u.member_path,
+                    u.usage_kind,
+                    u.line as i64
+                ],
             )
             .unwrap();
         }
@@ -1826,4 +1840,98 @@ async fn find_unreferenced_objects_response_fits_requested_budget() {
         "при клампе итоговый размер {len} превысил потолок {hard}"
     );
     assert_eq!(raw["result"]["results_total"].as_u64(), Some(N as u64));
+}
+
+/// F2 (E-2): страж на уровне `execute` — утяжелённый обход обязан быть прерван
+/// таймером `execute` и вернуть ОШИБКУ, а не висеть до конца (и не отдать
+/// числа). Юнит-тест `blocking_query_is_interrupted_by_timer` проверяет только
+/// сам механизм `spawn_blocking` + `sqlite3_interrupt`; проводка таймера в
+/// `execute` проверяется здесь.
+///
+/// Обход делается заведомо дольше таймаута (`QUERY_TIMEOUT_SECS = 8`): у
+/// `metadata_code_usages` снят индекс `idx_mcu_ref`, поэтому корреляционный
+/// подзапрос обращений в `load_objects` вырождается в полный скан таблицы на
+/// КАЖДЫЙ объект (200 000 строк × 20 000 объектов ≈ 4·10⁹ сравнений строк — это
+/// десятки секунд, т.е. к моменту срабатывания таймера обход гарантированно
+/// внутри одного длинного запроса, а не в промежутке между ними). Прерывание
+/// доходит до `execute` ошибкой `OperationInterrupted` → ответ
+/// `{error: "database error: …"}`.
+///
+/// Тест намеренно дорогой (≈8 с): это РЕАЛЬНЫЙ таймаут инструмента, а не
+/// тестовый хук.
+#[tokio::test]
+async fn find_unreferenced_objects_execute_interrupts_heavy_scan() {
+    const OBJECTS: usize = 20_000;
+    const USAGES: usize = 200_000;
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute("DROP INDEX IF EXISTS idx_mcu_ref", [])
+            .unwrap();
+        // Одной транзакцией: 220 000 отдельных автокоммитов — это минуты.
+        conn.execute("BEGIN", []).unwrap();
+        {
+            let mut obj = conn
+                .prepare(
+                    "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                     VALUES ('default', ?1, 'Catalog', ?2)",
+                )
+                .unwrap();
+            for i in 0..OBJECTS {
+                let name = format!("O{i:05}");
+                obj.execute(params![format!("Catalog.{name}"), name])
+                    .unwrap();
+            }
+        }
+        {
+            let mut usage = conn
+                .prepare(
+                    "INSERT INTO metadata_code_usages \
+                     (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+                     VALUES ('default', ?1, ?2, NULL, 'manager', \
+                             'Catalogs/X/Ext/ManagerModule.bsl', 1)",
+                )
+                .unwrap();
+            for i in 0..USAGES {
+                let name = format!("O{:05}", i % OBJECTS);
+                usage
+                    .execute(params![
+                        format!("Catalog.{name}"),
+                        format!("catalog.{}", name.to_lowercase())
+                    ])
+                    .unwrap();
+            }
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+        conn.execute("COMMIT", []).unwrap();
+    }
+
+    let t = Instant::now();
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    let elapsed = t.elapsed();
+    println!("F2 execute+interrupt: elapsed={elapsed:?} res={res}");
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("database error"),
+        "утяжелённый обход обязан прерваться ошибкой базы, а не отдать числа: {res}"
+    );
+    assert!(
+        res["results"].is_null(),
+        "при прерывании чисел быть не должно: {res}"
+    );
+    // Нижняя граница — доказательство, что сработал таймер (≈8 с), а не «упало
+    // сразу»; верхняя — что таймер именно прервал обход, а не завис.
+    assert!(
+        elapsed >= Duration::from_secs(7) && elapsed < Duration::from_secs(30),
+        "таймер execute обязан прервать обход за ≈8 с: {elapsed:?}"
+    );
 }

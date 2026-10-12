@@ -547,7 +547,10 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //     (`ПолучитьОбщийМакет("X")`, object_ref = "CommonTemplate") |
     //     `template_call_via_manager` (`Справочники.X.ПолучитьМакет("Y")`,
     //     object_ref = владелец `Catalog.X`) | `template_call_via_receiver`
-    //     (метод-форма с нераспознанным приёмником — счётчик непокрытой формы).
+    //     (метод-форма с нераспознанным приёмником — счётчик непокрытой формы) |
+    //     `common_picture`/`style_item` (общие картинки и элементы стиля) |
+    //     `common_module_via_literal` (`ОбщийМодуль("X")`/`CommonModule("X")`,
+    //     object_ref = "CommonModule.X").
     //   * `file_path`      — путь модуля относительно корня репо (forward slash).
     //   * `line`           — номер строки (1-based).
     //

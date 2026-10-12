@@ -29,6 +29,17 @@
 //     (`Переменная.ПолучитьМакет("Y")`): владельца по имени приёмника не
 //     вывести; строка кладётся в индекс СЧЁТЧИКОМ непокрытой формы (макет не
 //     снимается), `object_ref = "Template"`/`"CommonTemplate"`.
+//   * `common_picture` — обращение к общей библиотеке картинок в коде
+//     (`БиблиотекаКартинок.X` / `PictureLibrary.X`) и ссылка в XML форм
+//     (`CommonPicture.X`): `object_ref = "CommonPicture.X"`.
+//   * `style_item` — обращение к элементу стиля в коде (`ЦветаСтиля.X`,
+//     `ШрифтыСтиля.X`) и ссылка `style:X` в XML: `object_ref = "StyleItem.X"`.
+//   * `common_module_via_literal` — строковый доступ к общему модулю
+//     `ОбщийМодуль("Имя")` (EN: `CommonModule("Имя")`): `object_ref =
+//     "CommonModule.<Имя>"`. Это обращение к САМОМУ объекту `CommonModule`
+//     (в отличие от канала графа, который видит только вызовы
+//     `Модуль.Метод()`); цель задана строкой, поэтому без разбора литерала
+//     ссылки в графе нет.
 //
 // Что НЕ ловит (осознанно): доступ через локальные переменные
 // (`Док = Документы.X; Док.Товары`) — нужен type inference, вне охвата.
@@ -36,7 +47,8 @@
 // `find_unreferenced_objects`: `template_call_non_literal` (аргумент —
 // переменная/склейка/второй аргумент), `template_call_english`
 // (`GetTemplate`/`GetCommonTemplate`), `template_call_multiline` (вызов с
-// переносом строки до литерала).
+// переносом строки до литерала), `common_module_via_non_literal`
+// (`ОбщийМодуль(Имя)` — имя модуля не литерал), `common_module_calls_via_*`.
 //
 // Русские формы множественного числа/типов нерегулярны (РегистрСведений →
 // РегистрыСведений, Обработка → Обработки) — задаются явной таблицей, не правилом.
@@ -56,7 +68,7 @@ pub struct CodeUsage {
     pub member_path: Option<String>,
     /// Вид обращения: `manager` | `ref_type` | `query` | `template_call` |
     /// `common_template_call` | `template_call_via_manager` |
-    /// `template_call_via_receiver`.
+    /// `template_call_via_receiver` | `common_module_via_literal`.
     pub usage_kind: &'static str,
     /// Номер строки в модуле (1-based).
     pub line: usize,
@@ -306,6 +318,44 @@ fn manager_map() -> &'static HashMap<String, &'static str> {
         for f in META_FORMS {
             m.insert(f.ru_plural.to_lowercase(), f.canonical);
             m.insert(f.en_plural.to_lowercase(), f.canonical);
+        }
+        m
+    })
+}
+
+/// Глобальные свойства-«библиотеки» платформы, из которых берутся элементы
+/// стиля и картинки. Обращение `<Коллекция>.<Имя>` в коде адресует объект
+/// метаданных ФИКСИРОВАННОГО типа (в отличие от менеджеров коллекций
+/// [`META_FORMS`], где тип выводится из имени коллекции):
+///
+///   * `БиблиотекаКартинок` (RU) / `PictureLibrary` (EN) и EN-форма
+///     метаданного `CommonPicture` → `CommonPicture.<Имя>`;
+///   * `ЦветаСтиля` / `StyleColors`, `ШрифтыСтиля` / `StyleFonts`,
+///     `РамкиСтиля` / `StyleBorders` → `StyleItem.<Имя>`.
+///
+/// На проверенной выгрузке (prod3) реально встречаются только RU-формы
+/// `БиблиотекаКартинок` и `ЦветаСтиля`/`ШрифтыСтиля`; EN-формы добавлены по
+/// имени свойства глобального контекста и безвредны, если не встречаются.
+/// Единственная форма с неподтверждённым написанием (`colorsstyle`) убрана
+/// (E7): в платформе свойство цвета стиля называется `StyleColors` (совр.
+/// справка), написания `ColorsStyle` нет ни в одной из проверяемых выгрузок.
+/// Значение — `(канонический префикс объекта, usage_kind)`.
+fn global_object_map() -> &'static HashMap<String, (&'static str, &'static str)> {
+    static M: OnceLock<HashMap<String, (&'static str, &'static str)>> = OnceLock::new();
+    M.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (form, canonical, kind) in [
+            ("библиотекакартинок", "CommonPicture", "common_picture"),
+            ("picturelibrary", "CommonPicture", "common_picture"),
+            ("commonpicture", "CommonPicture", "common_picture"),
+            ("цветастиля", "StyleItem", "style_item"),
+            ("stylecolors", "StyleItem", "style_item"),
+            ("шрифтыстиля", "StyleItem", "style_item"),
+            ("stylefonts", "StyleItem", "style_item"),
+            ("рамкистиля", "StyleItem", "style_item"),
+            ("styleborders", "StyleItem", "style_item"),
+        ] {
+            m.insert(form.to_string(), (canonical, kind));
         }
         m
     })
@@ -573,6 +623,90 @@ fn template_calls(code: &str, strings: &[String], line: usize) -> Vec<CodeUsage>
     out
 }
 
+/// Имя общего модуля из строкового доступа `ОбщийМодуль("Имя")` (EN-форма —
+/// `CommonModule("Имя")`) в РЕАЛЬНОМ коде строки (Требование 2 ТЗ, C2).
+/// Платформенная функция возвращает объект общего модуля ПО ИМЕНИ, поэтому
+/// строковый литерал — ссылка на объект `CommonModule.<Имя>`; в
+/// `proc_call_graph` такой ссылки нет (там только вызовы `Модуль.Метод()`), а в
+/// `metadata_code_usages` до этого вида не было вовсе.
+///
+///   * имя — ОДИН строковый литерал и ЕДИНСТВЕННЫЙ аргумент: `ОбщийМодуль(Имя)`,
+///     `ОбщийМодуль("X" + Суффикс)`, `ОбщийМодуль("X", Второй)` цели не дают
+///     (имя известно только в рантайме — форма названа в
+///     `channels_not_applied` как `common_module_via_non_literal`);
+///   * ГОЛАЯ форма — `ОбщийМодуль("Имя")`/`CommonModule("Имя")`; метод-форма
+///     (`Переменная.ОбщийМодуль("X")`) не извлекается: у произвольного объекта
+///     может быть СВОЙ метод с таким именем, платформенная функция тут ни при
+///     чём;
+///   * имя обязано быть похожим на идентификатор 1С (буквы/цифры/`_`).
+///
+/// EN-форма (`CommonModule("Имя")`) принята симметрично остальным формам этого
+/// модуля; в проверенных выгрузках (prod3, ЗУП) она не встречалась — там только
+/// RU-форма (проверено сплошным сканом всех `.bsl`).
+fn common_module_literals(code: &str, strings: &[String], line: usize) -> Vec<CodeUsage> {
+    let chars: Vec<char> = code.chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if !is_word(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_word(chars[i]) {
+            i += 1;
+        }
+        let ident: String = chars[start..i].iter().collect();
+        match ident.to_lowercase().as_str() {
+            "общиймодуль" | "commonmodule" => {}
+            _ => continue,
+        }
+        // Метод-форма: слева точка — это метод чужого объекта, не функция
+        // платформы.
+        if start > 0 && chars[start - 1] == '.' {
+            continue;
+        }
+        let mut j = i;
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != '(' {
+            continue;
+        }
+        j += 1;
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != STRING_MARKER {
+            continue; // аргумент не литерал (выражение/переменная/перенос строки)
+        }
+        // Номер маркера = индекс литерала в `strings` этой строки.
+        let ordinal = chars[..j].iter().filter(|c| **c == STRING_MARKER).count();
+        j += 1;
+        // Только закрывающая скобка сразу: иначе это склейка или 2-й аргумент.
+        while j < n && is_space(chars[j]) {
+            j += 1;
+        }
+        if j >= n || chars[j] != ')' {
+            continue;
+        }
+        i = j + 1;
+        let name = match strings.get(ordinal) {
+            Some(name) if !name.is_empty() && name.chars().all(is_word) => name.clone(),
+            _ => continue,
+        };
+        out.push(make_usage(
+            "CommonModule",
+            &name,
+            None,
+            "common_module_via_literal",
+            line,
+        ));
+    }
+    out
+}
+
 /// Владелец макета из менеджер-приёмника метод-вызова: `dot` указывает на `.`
 /// перед именем метода; цепочка слева — `Идент(.Идент)*`. Если первый
 /// идентификатор цепочки — менеджер коллекции из [`manager_map`] (не менее двух
@@ -619,7 +753,13 @@ fn receiver_chain(chars: &[char], dot: usize) -> Vec<String> {
 }
 
 /// Непересекающиеся пары `ident.ident` (аналог regex `(\w+)\.(\w+)` finditer).
-fn dotted_pairs(s: &str) -> Vec<(String, String)> {
+/// Третий элемент пары — признак «это НЕ ссылка на объект метаданных» (E4):
+/// метод (сразу за вторым идентификатором стоит `(`) или доступ к полю объекта
+/// (первый идентификатор предшествуется `.`/словом). Признак применяют только к
+/// глобальным «библиотекам» (`БиблиотекаКартинок.X`, `ЦветаСтиля.X`): там
+/// `БиблиотекаКартинок.Есть(...)` — метод коллекции, а
+/// `Объект.БиблиотекаКартинок.Комментарий` — поле объекта, а не объект-картинка.
+fn dotted_pairs(s: &str) -> Vec<(String, String, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
@@ -638,7 +778,15 @@ fn dotted_pairs(s: &str) -> Vec<(String, String)> {
                     i += 1;
                 }
                 let id2: String = chars[s2..i].iter().collect();
-                out.push((id1, id2));
+                // Доступ к полю: перед первым идентификатором стоит `.`.
+                // Проверки `is_word(chars[st - 1])` здесь НЕТ и она недостижима:
+                // цикл выше съедает максимальный прогон словных символов, поэтому
+                // в `st` он попадает только на позицию, где слева либо начало
+                // строки, либо НЕсловный символ (F3).
+                let field_access = st > 0 && chars[st - 1] == '.';
+                // Метод: сразу за вторым идентификатором — открывающая скобка.
+                let method_call = i < n && chars[i] == '(';
+                out.push((id1, id2, field_access || method_call));
                 // Перекрытие: продолжаем со ВТОРОГО идентификатора пары, а не за
                 // ней. Иначе в `Метаданные.Справочники.X` коллекция стоит вторым
                 // сегментом, первая пара отбрасывается, и `Справочники.X` уже не
@@ -755,10 +903,20 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
         in_string = carry;
 
         // manager — только в реальном коде (строки/комментарии вырезаны).
+        // Второй формой ловятся глобальные «библиотеки» (`БиблиотекаКартинок.X`,
+        // `ЦветаСтиля.X`) — это тоже пары `Идент.Идент`, но цель фиксирована.
         if code.contains('.') {
-            for (g1, g2) in dotted_pairs(&code) {
-                if let Some(&canon) = manager_map().get(&g1.to_lowercase()) {
+            for (g1, g2, not_a_ref) in dotted_pairs(&code) {
+                let low = g1.to_lowercase();
+                if let Some(&canon) = manager_map().get(&low) {
                     out.push(make_usage(canon, &g2, None, "manager", lineno));
+                } else if let Some(&(canon, kind)) = global_object_map().get(&low) {
+                    // E4: метод коллекции (`БиблиотекаКартинок.Есть(…)`) и доступ
+                    // к полю объекта (`Объект.БиблиотекаКартинок.Комментарий`) —
+                    // НЕ ссылки на объекты `CommonPicture`/`StyleItem`.
+                    if !not_a_ref {
+                        out.push(make_usage(canon, &g2, None, kind, lineno));
+                    }
                 }
             }
         }
@@ -795,6 +953,11 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
         // делает find_unreferenced_objects; у метод-формы с менеджер-приёмником
         // владелец уже в object_ref.
         out.extend(template_calls(&code, &strings, lineno));
+
+        // common_module_via_literal — `ОбщийМодуль("Имя")`: строковый доступ к
+        // общему модулю по имени (канал общих модулей, F1b). Имя модуля уже
+        // канонично (`CommonModule.<Имя>`) — резолв по файлу не нужен.
+        out.extend(common_module_literals(&code, &strings, lineno));
     }
     out
 }
@@ -981,6 +1144,67 @@ pub fn extract_query_usages(text: &str) -> Vec<CodeUsage> {
 fn is_virtual_table(name: &str) -> bool {
     let low = name.to_lowercase();
     QUERY_VIRTUAL_TABLES.iter().any(|v| v.to_lowercase() == low)
+}
+
+/// Извлечь обращения к объектам метаданных из XML-ФАЙЛА выгрузки (описание
+/// формы, схема, стиль, объектный XML). Понимает две формы ссылок, которые в
+/// коде не встречаются (или встречаются иначе):
+///
+///   * `CommonPicture.<Имя>` — `<xr:Ref>CommonPicture.X</xr:Ref>` в свойствах
+///     форм, `<img src="CommonPicture.X">` и пр. →
+///     `object_ref = "CommonPicture.X"`, `usage_kind = "common_picture"`;
+///   * `style:<Имя>` — цвет/шрифт/рамка стиля (`<TextColor>style:X</TextColor>`,
+///     `<dcscor:value xsi:type="v8ui:Color">style:X</dcscor:value>`) →
+///     `object_ref = "StyleItem.X"`, `usage_kind = "style_item"`.
+///
+/// Разбор лёгкий и построчный: цель — не структура XML, а сами ссылки, поэтому
+/// ищем маркер подстрокой. Подавать `ConfigDumpInfo.xml` (опись выгрузки, где
+/// перечислены ИМЕНА всех объектов, а не ссылки) НЕЛЬЗЯ — иначе каждый объект
+/// «найдётся» сам на себя; этот файл отсеивает вызывающий (по имени).
+///
+/// `ЦветаСтиля.X`/`БиблиотекаКартинок.X` в XML не пишутся (там формы
+/// `style:X`/`CommonPicture.X`), поэтому XML-разбор их не ищет.
+pub fn extract_xml_usages(content: &str) -> Vec<CodeUsage> {
+    let mut out: Vec<CodeUsage> = Vec::new();
+    for (idx, raw) in content.split('\n').enumerate() {
+        let lineno = idx + 1;
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        scan_xml_marker(
+            raw,
+            "CommonPicture.",
+            "CommonPicture",
+            "common_picture",
+            lineno,
+            &mut out,
+        );
+        scan_xml_marker(raw, "style:", "StyleItem", "style_item", lineno, &mut out);
+    }
+    out
+}
+
+/// Найти все вхождения `marker<Идент>` в одной строке XML и добавить обращения.
+/// Идентификатор после маркера — буквы/цифры/`_` ([`is_word`]); пустой не даёт
+/// обращения.
+fn scan_xml_marker(
+    line: &str,
+    marker: &str,
+    canonical: &str,
+    kind: &'static str,
+    lineno: usize,
+    out: &mut Vec<CodeUsage>,
+) {
+    let mut from = 0usize;
+    while let Some(pos) = line[from..].find(marker) {
+        let start = from + pos + marker.len();
+        let name: String = line[start..].chars().take_while(|c| is_word(*c)).collect();
+        if !name.is_empty() {
+            out.push(make_usage(canonical, &name, None, kind, lineno));
+        }
+        from = start;
+        if from >= line.len() {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1400,5 +1624,225 @@ mod tests {
         assert_eq!(r[0].usage_kind, "template_call");
         assert_eq!(r[0].member_path.as_deref(), Some("Цель"));
         assert_eq!(r[0].line, 2);
+    }
+
+    // ── common_module_via_literal (F1b: строковый доступ к общему модулю) ─────
+
+    #[test]
+    fn common_module_literal_in_code_is_usage() {
+        let r = kinds("МодульСобытия = ОбщийМодуль(\"ОбменДаннымиСобытия\");");
+        assert_eq!(
+            r,
+            vec![(
+                "CommonModule.ОбменДаннымиСобытия".to_string(),
+                None,
+                "common_module_via_literal"
+            )]
+        );
+    }
+
+    #[test]
+    fn common_module_literal_en_form_and_inner_spaces() {
+        let r = kinds("M = CommonModule( \"CommonModuleName\" );");
+        assert_eq!(
+            r,
+            vec![(
+                "CommonModule.CommonModuleName".to_string(),
+                None,
+                "common_module_via_literal"
+            )]
+        );
+    }
+
+    /// Непокрытые формы не извлекаются вовсе: имя не литерал, склейка, второй
+    /// аргумент, метод чужого объекта, имя с пробелом, часть длинного
+    /// идентификатора (`ОбщегоНазначенияОбщийМодуль(…)` — обёртка БСП).
+    #[test]
+    fn common_module_literal_ignored_outside_real_code_or_without_single_literal() {
+        assert!(kinds("Модуль = ОбщийМодуль(Имя);").is_empty());
+        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен\" + Суффикс);").is_empty());
+        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен\", Параметр);").is_empty());
+        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен Данными\");").is_empty());
+        assert!(kinds("Модуль = ОбщийМодуль(\"\");").is_empty());
+        assert!(kinds("Модуль = Переменная.ОбщийМодуль(\"Обмен\");").is_empty());
+        assert!(kinds("Модуль = ОбщегоНазначенияОбщийМодуль(\"Обмен\");").is_empty());
+        assert!(kinds("// ОбщийМодуль(\"Обмен\")").is_empty());
+        assert!(kinds("С = \"ОбщийМодуль(\"\"Обмен\"\")\";").is_empty());
+    }
+
+    /// Соседние извлечения на той же строке не ломаются (маркер литерала).
+    #[test]
+    fn common_module_literal_does_not_break_neighbour_usages() {
+        let r = extract_code_usages(
+            "Схема = ПолучитьМакет(\"Макет1\"); М = ОбщийМодуль(\"Обмен\"); Д = Документы.Заказ;",
+        );
+        let got: Vec<(&str, &str)> = r
+            .iter()
+            .map(|u| (u.object_ref.as_str(), u.usage_kind))
+            .collect();
+        assert!(
+            got.contains(&("CommonModule.Обмен", "common_module_via_literal")),
+            "{r:?}"
+        );
+        assert!(
+            r.iter()
+                .any(|u| u.usage_kind == "template_call"
+                    && u.member_path.as_deref() == Some("Макет1")),
+            "{r:?}"
+        );
+        assert!(got.contains(&("Document.Заказ", "manager")), "{r:?}");
+    }
+
+    // ── common_picture / style_item (D1: ссылки на картинки и элементы стиля) ──
+
+    #[test]
+    fn picture_library_in_code_is_common_picture() {
+        // RU-форма обращения к общей библиотеке картинок (реальный синтаксис).
+        let r = kinds("Картинка = БиблиотекаКартинок.Комментарий;");
+        assert_eq!(
+            r,
+            vec![(
+                "CommonPicture.Комментарий".to_string(),
+                None,
+                "common_picture"
+            )]
+        );
+        // EN-форма свойства глобального контекста.
+        let r = kinds("Pic = PictureLibrary.Answer;");
+        assert_eq!(
+            r,
+            vec![("CommonPicture.Answer".to_string(), None, "common_picture")]
+        );
+        // Форма метаданного (в XML встречается как CommonPicture.X).
+        let r = kinds("P = CommonPicture.Информация32;");
+        assert_eq!(
+            r,
+            vec![(
+                "CommonPicture.Информация32".to_string(),
+                None,
+                "common_picture"
+            )]
+        );
+    }
+
+    #[test]
+    fn style_collection_in_code_is_style_item() {
+        let r = kinds("Цвет = ЦветаСтиля.ПросроченныеДанныеЦвет;");
+        assert_eq!(
+            r,
+            vec![(
+                "StyleItem.ПросроченныеДанныеЦвет".to_string(),
+                None,
+                "style_item"
+            )]
+        );
+        let r = kinds("Ш = ШрифтыСтиля.КрупныйШрифтТекста;");
+        assert_eq!(
+            r,
+            vec![(
+                "StyleItem.КрупныйШрифтТекста".to_string(),
+                None,
+                "style_item"
+            )]
+        );
+        let r = kinds("C = StyleColors.AccentColor;");
+        assert_eq!(
+            r,
+            vec![("StyleItem.AccentColor".to_string(), None, "style_item")]
+        );
+    }
+
+    #[test]
+    fn picture_and_style_ignored_in_strings_and_comments() {
+        // В строке/комментарии это текст, а не обращение.
+        assert!(kinds("С = \"БиблиотекаКартинок.Папка\";").is_empty());
+        assert!(kinds("// ЦветаСтиля.ЦветФонаФормы").is_empty());
+    }
+
+    /// E4: метод коллекции и доступ к полю НЕ являются ссылками на объекты
+    /// метаданных (ложный класс «метод библиотеки / доступ к полю»).
+    #[test]
+    fn picture_library_method_and_field_access_are_not_usages() {
+        // (а) метод коллекции: `БиблиотекаКартинок.Есть(Имя)` — метод, а не
+        // обращение к объекту `CommonPicture.Есть`.
+        assert!(
+            kinds("Если БиблиотекаКартинок.Есть(Имя) Тогда").is_empty(),
+            "метод библиотеки картинок не должен давать common_picture"
+        );
+        // (б) доступ к полю объекта: `<Объект>.БиблиотекаКартинок.Комментарий`.
+        assert!(
+            kinds("К = МойОбъект.БиблиотекаКартинок.Комментарий;").is_empty(),
+            "поле объекта не должно давать common_picture"
+        );
+        // То же правило для элементов стиля.
+        assert!(kinds("Ц = МойОбъект.ЦветаСтиля.ЦветФона;").is_empty());
+        assert!(kinds("Ш = МойОбъект.ШрифтыСтиля.Шрифт;").is_empty());
+        assert!(kinds("Р = МойОбъект.РамкиСтиля.Рамка;").is_empty());
+        // Настоящее обращение (без метода/поля) остаётся видимым.
+        let r = kinds("К = БиблиотекаКартинок.Комментарий;");
+        assert_eq!(
+            r,
+            vec![(
+                "CommonPicture.Комментарий".to_string(),
+                None,
+                "common_picture"
+            )]
+        );
+        // И обычная ссылка на элемент стиля тоже.
+        let r = kinds("Ц = ЦветаСтиля.ПросроченныеДанныеЦвет;");
+        assert_eq!(
+            r,
+            vec![(
+                "StyleItem.ПросроченныеДанныеЦвет".to_string(),
+                None,
+                "style_item"
+            )]
+        );
+    }
+
+    #[test]
+    fn xml_usages_extract_picture_and_style_forms() {
+        let xml = r#"<Form>
+  <Picture><xr:Ref>CommonPicture.Напоминание</xr:Ref></Picture>
+  <TextColor>style:ПросроченныеДанныеЦвет</TextColor>
+  <dcscor:value xsi:type="v8ui:Color">style:НедоступныеДанныеЦвет</dcscor:value>
+</Form>"#;
+        let r = extract_xml_usages(xml);
+        let got: Vec<(String, &str, usize)> = r
+            .iter()
+            .map(|u| (u.object_ref.clone(), u.usage_kind, u.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("CommonPicture.Напоминание".to_string(), "common_picture", 2),
+                (
+                    "StyleItem.ПросроченныеДанныеЦвет".to_string(),
+                    "style_item",
+                    3
+                ),
+                (
+                    "StyleItem.НедоступныеДанныеЦвет".to_string(),
+                    "style_item",
+                    4
+                ),
+            ],
+            "{r:?}"
+        );
+        // Ключи в нижнем регистре — регистронезависимый поиск без UDF.
+        assert_eq!(r[1].object_ref_key, "styleitem.просроченныеданныецвет");
+    }
+
+    #[test]
+    fn xml_usages_ignore_namespace_and_manifest_like_text() {
+        // `xmlns:style="..."` — объявление пространства имён, не ссылка.
+        let xml = r#"<MetaDataObject xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:xsi="x" version="2.13"/>"#;
+        assert!(
+            extract_xml_usages(xml).is_empty(),
+            "{:?}",
+            extract_xml_usages(xml)
+        );
+        // Пустой идентификатор после маркера не даёт обращения.
+        assert!(extract_xml_usages("<a>style:</a>").is_empty());
     }
 }

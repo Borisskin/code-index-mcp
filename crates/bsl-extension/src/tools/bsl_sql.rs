@@ -78,8 +78,15 @@ impl IndexTool for BslSqlTool {
          metadata_code_usages(object_ref, object_ref_key, member_path, usage_kind, file_path, line; \
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
          object_ref_key уже в нижнем регистре для поиска из приложения; \
-         usage_kind: manager | ref_type | query | template_call | common_template_call | \
-         template_call_via_manager | template_call_via_receiver; ВНИМАНИЕ: у строк \
+         usage_kind: manager | ref_type | query | common_picture | style_item | template_call | \
+         common_template_call | template_call_via_manager | template_call_via_receiver | \
+         common_module_via_literal; \
+         common_picture — обращение к общей картинке (object_ref = 'CommonPicture.X': \
+         'БиблиотекаКартинок.X'/'CommonPicture.X' из кода и CommonPicture.X из XML выгрузки); \
+         style_item — обращение к элементу стиля (object_ref = 'StyleItem.X': \
+         'ЦветаСтиля.X'/'ШрифтыСтиля.X' из кода и style:X из XML); \
+         common_module_via_literal — строковый доступ к общему модулю \
+         (object_ref = 'CommonModule.X': ОбщийМодуль(\"X\")/CommonModule(\"X\")); ВНИМАНИЕ: у строк \
          template_call_via_receiver object_ref = 'Template'/'CommonTemplate' (имя макета — \
          в member_path), у template_call_via_manager object_ref = владелец 'Catalog.X', \
          то есть object_ref у template* — НЕ имя объекта перечня; форма ПолучитьМакет(\"Y\") \
