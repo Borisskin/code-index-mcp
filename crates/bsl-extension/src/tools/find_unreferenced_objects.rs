@@ -102,8 +102,10 @@
 //     ожидания — `ОписаниеОповещения("ОбщийМодуль.Метод", …)`,
 //     `ПодключитьОбработчикОжидания("ОбщийМодуль.Метод", …)`
 //     (`common_module_calls_via_qualified_literal`);
-//   * `ОбщийМодуль(<выражение>)` — имя модуля не литерал, статически не
-//     материализуемо (`common_module_via_non_literal`).
+//   * `ОбщийМодуль(Выражение)` (имя модуля не литерал) и
+//     квалифицированная/метод-форма `ОбщегоНазначения.ОбщийМодуль("X")` —
+//     обращение к объекту `CommonModule` по этим строкам не извлекается
+//     (`common_module_via_qualified_or_expression`).
 // Цель во всех этих формах задана строкой, а не вызовом `Модуль.Метод()`,
 // поэтому ребра `proc_call_graph` для неё нет, и общий модуль может попасть в
 // `results`, хотя используется. HTTPService/WebService-модули при этом В ГРАФЕ
@@ -177,9 +179,11 @@ const NOT_INDEXED_COMMON_MODULE_FORMS: &[&str] = &[
     // `ПодключитьОбработчикОжидания("ОбщийМодуль.Метод", …)`. Индексер эти
     // вызовы не разбирает (см. §1.1 ТЗ: динамический слой C1).
     "common_module_calls_via_qualified_literal",
-    // `ОбщийМодуль(Выражение)` — имя модуля не литерал: цель статически не
-    // материализуема (тот же класс, что `template_call_non_literal`).
-    "common_module_via_non_literal",
+    // `ОбщийМодуль(Выражение)` (имя модуля не литерал) и
+    // квалифицированная/метод-форма `ОбщегоНазначения.ОбщийМодуль("X")`
+    // (литерал при не-платформенном приёмнике): по этим строкам обращение к
+    // объекту `CommonModule` не извлекается — цель не становится видимой.
+    "common_module_via_qualified_or_expression",
 ];
 
 /// Виды `usage_kind`, которые кладёт индексер канала макетов. Если в
@@ -251,7 +255,9 @@ impl IndexTool for FindUnreferencedObjectsTool {
          channels_applied показывает, что именно проверено, template_call_sites_unresolved \
          — сколько МЕСТ вызова макетов не удалось привязать к владельцу, \
          template_call_sites_missing_target — сколько мест указывают на макет вне \
-         реестра, channels_not_applied — какие формы не индексируются. При \
+         реестра, common_module_literal_sites_missing_target — сколько мест \
+         ОбщийМодуль(\"Имя\") указывают на общий модуль вне реестра, \
+         channels_not_applied — какие формы не индексируются. При \
          устаревшем индексе (stale=true) числа не отдаются (results=null). Ответ: \
          results (страницами по бюджету) + results_total/shown/offset/has_more, \
          by_meta_type, channels_applied, channels_not_applied, formula_version. \
@@ -444,6 +450,8 @@ fn page_and_wrap(
         "not_addressable": scan.not_addressable,
         "template_call_sites_unresolved": scan.template_call_sites_unresolved,
         "template_call_sites_missing_target": scan.template_call_sites_missing_target,
+        "common_module_literal_sites_missing_target": scan
+            .common_module_literal_sites_missing_target,
         "template_call_sites_uncovered": {
             "via_receiver": scan.template_call_sites_uncovered,
         },
@@ -521,6 +529,12 @@ struct Scan {
     /// реестра»). Отличается от `template_call_sites_unresolved`: там владелец
     /// не выведен вовсе.
     template_call_sites_missing_target: usize,
+    /// МЕСТА вызова (не объекты): `ОбщийМодуль("Имя")`
+    /// (`usage_kind = common_module_via_literal`), где цель
+    /// `CommonModule.<Имя>` отсутствует в реестре объектов («цель вне
+    /// реестра») — аналог `template_call_sites_missing_target` для строкового
+    /// канала общих модулей (A-асимметрия метрик).
+    common_module_literal_sites_missing_target: usize,
     /// МЕСТА вызова (не объекты): непокрытая форма
     /// `template_call_via_receiver` — метод-вызов с нераспознанным приёмником
     /// (владельца не вывести) — счётчик.
@@ -587,6 +601,8 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
     let common_calls = load_common_template_calls(conn, &common_members)?;
     let template_call_sites_uncovered = load_uncovered_template_calls(conn)?;
     let template_call_sites_missing_target = load_missing_target_sites(conn)?;
+    let common_module_literal_sites_missing_target =
+        load_common_module_literal_missing_target_sites(conn)?;
     // Канал общих модулей: объекты, чьи модули адресованы ВНЕШНИМИ рёбрами
     // графа (a) и/или назначены обработчиками подписок (c).
     let common_modules = load_common_module_index(conn)?;
@@ -698,6 +714,7 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
         not_addressable,
         template_call_sites_unresolved,
         template_call_sites_missing_target,
+        common_module_literal_sites_missing_target,
         template_call_sites_uncovered,
         channels_not_applied,
     })
@@ -962,6 +979,47 @@ fn load_missing_target_sites(conn: &rusqlite::Connection) -> rusqlite::Result<us
         }
         let target = format!("{}.template.{}", owner_key, member.to_lowercase());
         if !templates.contains(&target) {
+            missing += 1;
+        }
+    }
+    Ok(missing)
+}
+
+/// МЕСТА вызова (строки) вида `ОбщийМодуль("Имя")`
+/// (`usage_kind = common_module_via_literal`), где цель `CommonModule.<Имя>`
+/// ОТСУТСТВУЕТ в реестре объектов: имя известно из литерала, но самого объекта
+/// модуля в дампе нет — снимать нечего, и в `results` он попасть не может.
+/// Аналог [`load_missing_target_sites`] для строкового канала общих модулей
+/// (единица — места вызова, не объекты).
+///
+/// Сравнение ключей ведём в Rust: `lower()` в SQLite кириллицу не берёт, а имена
+/// общих модулей кириллические.
+fn load_common_module_literal_missing_target_sites(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<usize> {
+    let mut modules: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT full_name_key FROM metadata_objects \
+             WHERE repo = ? AND meta_type = 'CommonModule'",
+        )?;
+        let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            modules.insert(row?);
+        }
+    }
+    let mut missing = 0usize;
+    let mut stmt = conn.prepare(
+        "SELECT object_ref_key FROM metadata_code_usages \
+         WHERE repo = ? AND usage_kind = 'common_module_via_literal'",
+    )?;
+    let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let key = row?;
+        if key.is_empty() {
+            continue;
+        }
+        if !modules.contains(&key) {
             missing += 1;
         }
     }
@@ -1383,6 +1441,15 @@ fn build_hint(scan: &Scan, meta_type: Option<&str>) -> String {
              владелец известен, но цель вне конфигурации/неполного дампа — снимать \
              нечего.",
             scan.template_call_sites_missing_target
+        ));
+    }
+    if scan.common_module_literal_sites_missing_target > 0 {
+        hint.push_str(&format!(
+            " {} мест вызова ОбщийМодуль(\"Имя\") указывают на общий модуль, которого \
+             нет в реестре объектов (common_module_literal_sites_missing_target): имя \
+             известно из литерала, но цель вне конфигурации/неполного дампа — \
+             снимать нечего.",
+            scan.common_module_literal_sites_missing_target
         ));
     }
     hint
@@ -2154,6 +2221,7 @@ mod tests {
             not_addressable: Map::new(),
             template_call_sites_unresolved: 2,
             template_call_sites_missing_target: 3,
+            common_module_literal_sites_missing_target: 2,
             template_call_sites_uncovered: 1,
             channels_not_applied: NOT_INDEXED_TEMPLATE_FORMS
                 .iter()
@@ -2387,6 +2455,45 @@ mod tests {
         let hint = build_hint(&scan, None);
         assert!(
             hint.contains("template_call_sites_missing_target"),
+            "{hint}"
+        );
+    }
+
+    /// D3 (строковый канал модулей): `ОбщийМодуль("Имя")`, где
+    /// `CommonModule.<Имя>` отсутствует в реестре, считается отдельно — аналог
+    /// `template_call_sites_missing_target` (единица — МЕСТА вызова).
+    #[test]
+    fn common_module_literal_missing_target_sites_are_counted() {
+        let conn = mem();
+        add_object(&conn, "CommonModule.Обмен", "CommonModule", "Обмен");
+        add_usage(
+            &conn,
+            "common_module_via_literal",
+            "CommonModule.Обмен",
+            "commonmodule.обмен",
+            None,
+            "CommonModules/Х/Ext/Module.bsl",
+        );
+        // Цель вне реестра: строка есть, объекта `CommonModule.Пропал` нет.
+        add_usage(
+            &conn,
+            "common_module_via_literal",
+            "CommonModule.Пропал",
+            "commonmodule.пропал",
+            None,
+            "CommonModules/Х/Ext/Module.bsl",
+        );
+
+        let scan = scan_repository(&conn, None).unwrap();
+        assert_eq!(scan.channels[11], 1, "снят только модуль из реестра");
+        assert_eq!(scan.common_module_literal_sites_missing_target, 1);
+        assert!(
+            result_names(&scan).is_empty(),
+            "модуль из реестра снят обращением, а цель вне реестра в results не попадает"
+        );
+        let hint = build_hint(&scan, None);
+        assert!(
+            hint.contains("common_module_literal_sites_missing_target"),
             "{hint}"
         );
     }
@@ -2872,7 +2979,9 @@ mod tests {
 
     /// E3/F1b/F1c: формы обращения к общим модулям, которые НЕ индексируются,
     /// всегда перечислены в `channels_not_applied` — пропуск канала виден, а не
-    /// молчит.
+    /// молчит. Обход списка ловит и переименование форм (G-2: квалифицированная/
+    /// метод-форма `ОбщегоНазначения.ОбщийМодуль("X")` и `ОбщийМодуль(Выражение)`
+    /// названы одним именем `common_module_via_qualified_or_expression`).
     #[test]
     fn background_job_common_module_form_is_listed() {
         let conn = mem();
@@ -2890,6 +2999,19 @@ mod tests {
                 .any(|c| c == "common_module_calls_via_background_job"),
             "форма фонового задания обязана быть в channels_not_applied: {:?}",
             scan.channels_not_applied
+        );
+        assert!(
+            scan.channels_not_applied
+                .iter()
+                .any(|c| c == "common_module_via_qualified_or_expression"),
+            "квалифицированная/метод-форма (и `ОбщийМодуль(Выражение)`) обязана \
+             быть названа: {:?}",
+            scan.channels_not_applied
+        );
+        let hint = build_hint(&scan, None);
+        assert!(
+            hint.contains("common_module_via_qualified_or_expression"),
+            "hint обязан называть форму: {hint}"
         );
     }
 
