@@ -382,7 +382,9 @@ impl IndexTool for GetNodeStructureTool {
          веток. Параметры: name — имя процедуры (обязательно, если не задан path+line), \
          path — сузить до конкретного модуля, max_depth — предел глубины (по умолчанию \
          3; при обрезке в ответе depth_truncated=true), limit — потолок блоков \
-         (по умолчанию 50, максимум 500). Модуль разбирается на месте (1,4–2,4 мс), \
+         (по умолчанию 50, максимум 500). В ответе также переменные: `variables` — \
+         объявленные в самой процедуре (локальные, с номерами строк), \
+         `module_variables` — модульные. Модуль разбирается на месте (1,4–2,4 мс), \
          хранимого артефакта нет. For BSL/1C repositories only."
     }
 
@@ -467,6 +469,24 @@ impl IndexTool for GetNodeStructureTool {
                 }));
             }
 
+            // Переменные: объявленные в самой процедуре отдельно от модульных —
+            // локальные ядро при индексации не собирает, и до сих пор их
+            // приходилось искать чтением модуля.
+            let variables: Vec<Value> = structure
+                .variables
+                .iter()
+                .filter(|v| v.caller == name)
+                .take(limit)
+                .map(|v| json!({ "name": v.name, "line": v.line }))
+                .collect();
+            let module_variables: Vec<Value> = structure
+                .variables
+                .iter()
+                .filter(|v| v.caller == "<module>")
+                .take(limit)
+                .map(|v| json!({ "name": v.name, "line": v.line }))
+                .collect();
+
             let mut out = json!({
                 "procedure": name,
                 "path": path,
@@ -477,6 +497,13 @@ impl IndexTool for GetNodeStructureTool {
                 "max_depth": max_depth,
                 "blocks": blocks,
                 "blocks_count": blocks.len(),
+                "variables": variables,
+                "variables_count": structure
+                    .variables
+                    .iter()
+                    .filter(|v| v.caller == name)
+                    .count(),
+                "module_variables": module_variables,
                 "calls_count": structure
                     .calls
                     .iter()

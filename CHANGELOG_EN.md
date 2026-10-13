@@ -15,6 +15,7 @@ Versioning — [SemVer](https://semver.org/).
 - **`get_node_structure` — the skeleton of a procedure.** Loops, try blocks and branches with line numbers and nesting depth, bounded by `max_depth`; when cut, an explicit `depth_truncated` marker plus a hint to raise the limit.
 - **`get_line_context` — what is on a line.** The enclosing procedure, every block containing the line, and the `in_loop` / `in_exception` / `depth` flags. Useful when the line is already known from another tool's answer or from an error message.
 - **Structural parsing in the core — `parse_structure`.** A single tree walk yields both the blocks and the call context; the callee name is produced by exactly the same rule that feeds the call graph (otherwise the context would not be found for qualified calls such as `Модуль.Метод`).
+- **Procedure-local variables in `get_node_structure`.** The response now carries `variables` — variables declared inside the procedure itself (name and declaration line) — and `module_variables` for module-level ones. The core does not collect local variables while indexing (only module-level ones reach the `variables` table), so "what is declared in this procedure" had to be answered by reading the module.
 
 ### Changed
 

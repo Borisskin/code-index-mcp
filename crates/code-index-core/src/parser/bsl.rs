@@ -470,11 +470,26 @@ pub struct BslCallSite {
     pub depth: u8,
 }
 
-/// Структурный разбор модуля: блоки и вызовы с контекстом.
+/// Объявленная переменная: локальная внутри процедуры или модульная.
+///
+/// Локальные переменные ядро при индексации не собирает (в таблицу `variables`
+/// попадают только модульные), поэтому «какие переменные объявлены в этой
+/// процедуре» до сих пор приходилось выяснять чтением модуля. Структурный разбор
+/// идёт по всему дереву, включая тела процедур, и может отдать их сразу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BslVariable {
+    /// Процедура-владелец; `<module>` — объявление уровня модуля.
+    pub caller: String,
+    pub name: String,
+    pub line: usize,
+}
+
+/// Структурный разбор модуля: блоки, вызовы с контекстом и объявленные переменные.
 #[derive(Debug, Clone, Default)]
 pub struct BslStructure {
     pub blocks: Vec<BslBlock>,
     pub calls: Vec<BslCallSite>,
+    pub variables: Vec<BslVariable>,
 }
 
 impl BslStructure {
@@ -597,6 +612,44 @@ pub fn parse_structure(source: &str) -> BslStructure {
                     depth,
                 });
                 depth = depth.saturating_add(1);
+            }
+            "var_statement" => {
+                // Локальное объявление внутри процедуры: грамматика даёт
+                // `var_statement` с идентификаторами напрямую — без
+                // `variable_spec`, который есть у модульного `var_definition`.
+                // Именно поэтому ядро при индексации локальные переменные не
+                // собирает: его обход смотрит только на `var_definition`.
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() != "identifier" {
+                        continue;
+                    }
+                    let name = node_text(child, source_bytes).to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    out.variables.push(BslVariable {
+                        caller: proc.clone().unwrap_or_else(|| "<module>".to_string()),
+                        name,
+                        line: child.start_position().row + 1,
+                    });
+                }
+            }
+            "variable_spec" => {
+                // Ловим сам спецификатор, а не узел объявления: `Перем А, Б;`
+                // даёт один узел объявления с двумя `variable_spec`, но имя
+                // узла-объявления у модуля и у тела процедуры оказалось разным —
+                // а спецификатор один и тот же.
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = node_text(name_node, source_bytes).to_string();
+                    if !name.is_empty() {
+                        out.variables.push(BslVariable {
+                            caller: proc.clone().unwrap_or_else(|| "<module>".to_string()),
+                            name,
+                            line: name_node.start_position().row + 1,
+                        });
+                    }
+                }
             }
             "method_call" => {
                 if let Some(callee) = callee_of(node, source_bytes) {
@@ -724,6 +777,27 @@ mod tests {
         let s = parse_structure("\u{0}\u{1}\u{2}бинарный");
         assert!(s.blocks.is_empty());
         assert!(s.calls.is_empty());
+    }
+
+    /// Переменные: модульная и локальные, с владельцем и строкой объявления.
+    #[test]
+    fn structure_collects_variables_with_scope() {
+        let source =
+            "Перем Модульная;\nПроцедура Тест()\n    Перем А, Б;\n    А = 1;\nКонецПроцедуры";
+        let s = parse_structure(source);
+        let got: Vec<(&str, &str, usize)> = s
+            .variables
+            .iter()
+            .map(|v| (v.caller.as_str(), v.name.as_str(), v.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("<module>", "Модульная", 1),
+                ("Тест", "А", 3),
+                ("Тест", "Б", 3),
+            ]
+        );
     }
 
     #[test]
