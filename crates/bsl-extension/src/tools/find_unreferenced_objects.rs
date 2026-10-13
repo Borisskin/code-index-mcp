@@ -566,7 +566,16 @@ struct ObjectRow {
 
 /// Полный проход: кандидаты без ссылок по всем каналам формулы "c2-v3".
 fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusqlite::Result<Scan> {
-    let objects = load_objects(conn, meta_type)?;
+    // ОДИН проход по `metadata_code_usages` (E-11): из него выводятся и виды
+    // обращений каждого объекта, и счётчики видов (замена серии COUNT/EXISTS и
+    // двух проходов «цель вне реестра»). До этого на каждый вызов приходилось
+    // ~6 полных сканов таблицы и коррелированный GROUP_CONCAT на каждый объект.
+    let usage = load_usage_index(conn)?;
+    // Ключи целей метрик «цель вне реестра»: макеты и общие модули реестра
+    // (по одному seek по idx_metadata_objects_meta_type).
+    let template_keys = load_meta_type_keys(conn, "Template")?;
+    let common_module_keys = load_meta_type_keys(conn, "CommonModule")?;
+    let objects = load_objects(conn, meta_type, &usage)?;
 
     // Владельцы макетов и имена общих макетов, до которых вообще может дойти
     // канал макетов: считаем по кандидатам без ссылок по простым каналам,
@@ -599,10 +608,12 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
     let (template_calls, template_call_sites_unresolved) = load_template_call_pairs(conn)?;
     let manager_calls = load_manager_template_pairs(conn, &owners)?;
     let common_calls = load_common_template_calls(conn, &common_members)?;
-    let template_call_sites_uncovered = load_uncovered_template_calls(conn)?;
-    let template_call_sites_missing_target = load_missing_target_sites(conn)?;
+    // Метрики «цель вне реестра» и непокрытая форма считаются из того же
+    // прохода, что и виды обращений (см. `load_usage_index`).
+    let template_call_sites_uncovered = usage.uncovered_template_calls;
+    let template_call_sites_missing_target = usage.missing_template_calls(&template_keys)?;
     let common_module_literal_sites_missing_target =
-        load_common_module_literal_missing_target_sites(conn)?;
+        usage.missing_common_module_literals(&common_module_keys)?;
     // Канал общих модулей: объекты, чьи модули адресованы ВНЕШНИМИ рёбрами
     // графа (a) и/или назначены обработчиками подписок (c).
     let common_modules = load_common_module_index(conn)?;
@@ -617,11 +628,11 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
     for form in NOT_INDEXED_COMMON_MODULE_FORMS {
         channels_not_applied.push((*form).to_string());
     }
-    if !template_call_kinds_present(conn)? {
+    if !usage.template_call_kinds_present() {
         channels_not_applied.push("template_calls_not_indexed".to_string());
     }
     for (kind, flag) in GLOBAL_KINDS {
-        if !usage_kind_present(conn, kind)? {
+        if !usage.kind_present(kind) {
             channels_not_applied.push((*flag).to_string());
         }
     }
@@ -720,11 +731,152 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
     })
 }
 
+/// Биты видов обращений объекта в коде (см. [`UsageIndex::flags`]).
+const KIND_ANY: u8 = 1;
+const KIND_COMMON_PICTURE: u8 = 2;
+const KIND_STYLE_ITEM: u8 = 4;
+const KIND_COMMON_MODULE_LITERAL: u8 = 8;
+
+/// ОДИН проход по `metadata_code_usages`, из которого выводится всё, что нужно
+/// обходу от этой таблицы (E-11):
+///
+///   * `flags` — виды обращений каждого объекта (биты [`KIND_ANY`],
+///     [`KIND_COMMON_PICTURE`], [`KIND_STYLE_ITEM`],
+///     [`KIND_COMMON_MODULE_LITERAL`]) — вместо коррелированного
+///     `GROUP_CONCAT(DISTINCT usage_kind)` на каждый объект (TEMPORARY B-TREE на
+///     строку и seek по `idx_mcu_ref` на каждый объект);
+///   * `kind_counts` — счётчики строк по видам: из них выводятся и наличие вида
+///     (`channels_not_applied`), и непокрытая форма `template_call_via_receiver`
+///     — вместо серии `COUNT(*)`/`COUNT(*) … usage_kind = ?` (индекса по
+///     `usage_kind` нет, каждый такой COUNT — полный скан таблицы);
+///   * `manager_template_calls` / `common_module_literal_keys` — МЕСТА вызовов,
+///     нужные метрикам «цель вне реестра» — вместо ещё двух полных сканов.
+///
+/// Замер на prod3 (31 551 строка): один проход 26 мс против ~70 мс у серии
+/// запросов, которые он заменяет (не считая случайных чтений по индексам).
+struct UsageIndex {
+    /// `object_ref_key` → битовая маска видов ([`KIND_ANY`] и т.д.).
+    flags: HashMap<String, u8>,
+    /// `usage_kind` → число строк в таблице.
+    kind_counts: HashMap<String, i64>,
+    /// Число строк непокрытой формы `template_call_via_receiver`.
+    uncovered_template_calls: usize,
+    /// `(ключ владельца, имя макета как в литерале)` из строк
+    /// `template_call_via_manager` — по ним считается «цель вне реестра».
+    manager_template_calls: Vec<(String, String)>,
+    /// `object_ref_key` строк `common_module_via_literal` — по ним считается
+    /// «общий модуль вне реестра».
+    common_module_literal_keys: Vec<String>,
+}
+
+impl UsageIndex {
+    /// Есть ли строки вида `kind`? Пустая таблица — «судить не о чем» (true):
+    /// свежая база без кода не должна давать оговорку о полноте канала.
+    fn kind_present(&self, kind: &str) -> bool {
+        if self.kind_counts.is_empty() {
+            return true;
+        }
+        self.kind_counts.get(kind).is_some_and(|n| *n > 0)
+    }
+
+    /// Материализован ли канал макетов: в таблице есть строки, и среди них есть
+    /// хотя бы одна строка вида из [`TEMPLATE_CALL_KINDS`].
+    fn template_call_kinds_present(&self) -> bool {
+        if self.kind_counts.is_empty() {
+            return true;
+        }
+        TEMPLATE_CALL_KINDS.iter().any(|k| self.kind_present(k))
+    }
+
+    /// МЕСТА вызова `Справочники.X.ПолучитьМакет("Y")`, где цель
+    /// `<владелец>.Template.Y` отсутствует в реестре объектов. Сравнение ключей
+    /// ведём в Rust: `lower()` в SQLite кириллицу не берёт.
+    fn missing_template_calls(&self, templates: &HashSet<String>) -> rusqlite::Result<usize> {
+        Ok(self
+            .manager_template_calls
+            .iter()
+            .filter(|(owner_key, member)| {
+                !templates.contains(&format!("{}.template.{}", owner_key, member.to_lowercase()))
+            })
+            .count())
+    }
+
+    /// МЕСТА вызова `ОбщийМодуль("Имя")`, где цель `CommonModule.<Имя>`
+    /// отсутствует в реестре объектов.
+    fn missing_common_module_literals(&self, modules: &HashSet<String>) -> rusqlite::Result<usize> {
+        Ok(self
+            .common_module_literal_keys
+            .iter()
+            .filter(|key| !key.is_empty() && !modules.contains(*key))
+            .count())
+    }
+}
+
+/// Собрать [`UsageIndex`] одним проходом по `metadata_code_usages`.
+fn load_usage_index(conn: &rusqlite::Connection) -> rusqlite::Result<UsageIndex> {
+    let mut index = UsageIndex {
+        flags: HashMap::new(),
+        kind_counts: HashMap::new(),
+        uncovered_template_calls: 0,
+        manager_template_calls: Vec::new(),
+        common_module_literal_keys: Vec::new(),
+    };
+    let mut stmt = conn.prepare(
+        "SELECT object_ref_key, usage_kind, member_path FROM metadata_code_usages \
+         WHERE repo = ?",
+    )?;
+    let rows = stmt.query_map(params!["default"], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (key, kind, member) = row?;
+        *index.kind_counts.entry(kind.clone()).or_insert(0) += 1;
+        let flags = index.flags.entry(key.clone()).or_insert(0);
+        *flags |= KIND_ANY;
+        match kind.as_str() {
+            "common_picture" => *flags |= KIND_COMMON_PICTURE,
+            "style_item" => *flags |= KIND_STYLE_ITEM,
+            "common_module_via_literal" => {
+                *flags |= KIND_COMMON_MODULE_LITERAL;
+                index.common_module_literal_keys.push(key.clone());
+            }
+            "template_call_via_receiver" => index.uncovered_template_calls += 1,
+            "template_call_via_manager" => {
+                if let Some(member) = member.filter(|m| !m.is_empty()) {
+                    index.manager_template_calls.push((key.clone(), member));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(index)
+}
+
+/// Ключи (`full_name_key`) всех объектов указанного `meta_type` — цели метрик
+/// «цель вне реестра». Один seek по `idx_metadata_objects_meta_type`.
+fn load_meta_type_keys(
+    conn: &rusqlite::Connection,
+    meta_type: &str,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut stmt = conn
+        .prepare("SELECT full_name_key FROM metadata_objects WHERE repo = ? AND meta_type = ?")?;
+    let rows = stmt.query_map(params!["default", meta_type], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
 /// Перечень объектов репо (с фильтром по типу) + флаги простых каналов.
-/// EXISTS-подзапросы бьют по индексам idx_dl_to_key / idx_rr_object_key —
-/// по одному seek на объект. Виды обращений в коде приходят ОДНИМ
-/// корреляционным подзапросом (idx_mcu_ref): из него выводятся и
-/// `code_usages`, и `common_picture`/`style_item` (E10 — без дублирующих EXISTS).
+/// Ключи ссылок берутся тремя последовательными проходами по covering-индексам
+/// (`idx_dl_to_key`, `idx_rr_object_key`) и одним проходом [`UsageIndex`] —
+/// вместо коррелированных EXISTS/`GROUP_CONCAT` на каждый объект (E-11:
+/// seek на объект давал ~4 тыс. случайных чтений и TEMPORARY B-TREE на строку).
 ///
 /// Фильтр `meta_type` подставляется в SQL ТОЛЬКО когда задан: `COLLATE NOCASE`
 /// (тип уже канонизирован на входе `execute`) ломал seek по
@@ -734,37 +886,51 @@ fn scan_repository(conn: &rusqlite::Connection, meta_type: Option<&str>) -> rusq
 fn load_objects(
     conn: &rusqlite::Connection,
     meta_type: Option<&str>,
+    usage: &UsageIndex,
 ) -> rusqlite::Result<Vec<ObjectRow>> {
+    // Множества ключей-целей: один проход по индексу вместо EXISTS на объект.
+    let mut referenced: HashSet<String> = HashSet::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT to_object_key FROM data_links WHERE repo = ?")?;
+        let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            referenced.insert(row?);
+        }
+    }
+    let mut rights_granted: HashSet<String> = HashSet::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT object_name_key FROM role_rights WHERE repo = ?")?;
+        let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            rights_granted.insert(row?);
+        }
+    }
+
     const COLS: &str = "\
-        SELECT mo.full_name, mo.full_name_key, mo.meta_type, mo.name, \
-            EXISTS(SELECT 1 FROM data_links dl \
-                   WHERE dl.repo = mo.repo AND dl.to_object_key = mo.full_name_key), \
-            EXISTS(SELECT 1 FROM role_rights rr \
-                   WHERE rr.repo = mo.repo AND rr.object_name_key = mo.full_name_key), \
-            (SELECT GROUP_CONCAT(DISTINCT mcu.usage_kind) FROM metadata_code_usages mcu \
-                   WHERE mcu.repo = mo.repo AND mcu.object_ref_key = mo.full_name_key) \
+        SELECT mo.full_name, mo.full_name_key, mo.meta_type, mo.name \
         FROM metadata_objects mo \
         WHERE mo.repo = ?1";
     let map_row = |r: &rusqlite::Row| {
-        // Один корреляционный подзапрос отдаёт все виды обращений объекта
-        // (E10): универсальный канал `code_usages` и подсчёт по видам
-        // `common_picture`/`style_item` выводятся из одного прохода, без
-        // дублирующих EXISTS (новые строки и так ловятся общим ключом).
-        let kinds: Option<String> = r.get(6)?;
-        let kinds = kinds.unwrap_or_default();
+        let full_name_key: String = r.get(1)?;
+        // Виды обращений объекта — из одного прохода `load_usage_index`
+        // (E10/E-11): универсальный канал `code_usages` и подсчёт по видам
+        // `common_picture`/`style_item` выводятся из одного и того же набора.
+        let kinds = usage.flags.get(&full_name_key).copied().unwrap_or(0);
         Ok(ObjectRow {
+            ch_data_links: referenced.contains(&full_name_key),
+            ch_role_rights: rights_granted.contains(&full_name_key),
             full_name: r.get(0)?,
-            full_name_key: r.get(1)?,
+            full_name_key,
             meta_type: r.get(2)?,
             name: r.get(3)?,
-            ch_data_links: r.get(4)?,
-            ch_role_rights: r.get(5)?,
-            ch_code_usages: !kinds.is_empty(),
-            ch_common_picture: kinds.split(',').any(|k| k == "common_picture"),
-            ch_style_item: kinds.split(',').any(|k| k == "style_item"),
+            ch_code_usages: kinds & KIND_ANY != 0,
+            ch_common_picture: kinds & KIND_COMMON_PICTURE != 0,
+            ch_style_item: kinds & KIND_STYLE_ITEM != 0,
             // F1b: строковый доступ `ОбщийМодуль("Имя")` — тот же проход, что
             // универсальный `code_usages`, без отдельного EXISTS (E10).
-            ch_common_module_literal: kinds.split(',').any(|k| k == "common_module_via_literal"),
+            ch_common_module_literal: kinds & KIND_COMMON_MODULE_LITERAL != 0,
         })
     };
     match meta_type {
@@ -930,102 +1096,6 @@ fn load_manager_template_pairs(
     Ok(out)
 }
 
-/// Число строк непокрытой формы `template_call_via_receiver` (метод-вызов с
-/// нераспознанным приёмником): макет по ним не снимается, но форма видна
-/// счётчиком (A1/A2). `0` — либо формы нет, либо индекс не материализован
-/// (на это укажет `template_calls_not_indexed`).
-fn load_uncovered_template_calls(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata_code_usages \
-         WHERE repo = ? AND usage_kind = 'template_call_via_receiver'",
-        params!["default"],
-        |r| r.get(0),
-    )?;
-    Ok(n.max(0) as usize)
-}
-
-/// МЕСТА вызова (строки) вида `Справочники.X.ПолучитьМакет("Y")`, где цель
-/// `<владелец>.Template.Y` ОТСУТСТВУЕТ в реестре объектов. Владелец известен из
-/// приёмника (в отличие от `template_call_sites_unresolved`), но самого макета в
-/// дампе нет — снимать нечего, метрика отделяет «цель вне реестра» (D3).
-///
-/// Сравнение ключей ведём в Rust: `lower()` в SQLite кириллицу не берёт, а имена
-/// макетов кириллические.
-fn load_missing_target_sites(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    let mut templates: HashSet<String> = HashSet::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT full_name_key FROM metadata_objects \
-             WHERE repo = ? AND meta_type = 'Template'",
-        )?;
-        let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
-        for row in rows {
-            templates.insert(row?);
-        }
-    }
-    let mut missing = 0usize;
-    let mut stmt = conn.prepare(
-        "SELECT object_ref_key, member_path FROM metadata_code_usages \
-         WHERE repo = ? AND usage_kind = 'template_call_via_manager' \
-           AND member_path IS NOT NULL",
-    )?;
-    let rows = stmt.query_map(params!["default"], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (owner_key, member) = row?;
-        if member.is_empty() {
-            continue;
-        }
-        let target = format!("{}.template.{}", owner_key, member.to_lowercase());
-        if !templates.contains(&target) {
-            missing += 1;
-        }
-    }
-    Ok(missing)
-}
-
-/// МЕСТА вызова (строки) вида `ОбщийМодуль("Имя")`
-/// (`usage_kind = common_module_via_literal`), где цель `CommonModule.<Имя>`
-/// ОТСУТСТВУЕТ в реестре объектов: имя известно из литерала, но самого объекта
-/// модуля в дампе нет — снимать нечего, и в `results` он попасть не может.
-/// Аналог [`load_missing_target_sites`] для строкового канала общих модулей
-/// (единица — места вызова, не объекты).
-///
-/// Сравнение ключей ведём в Rust: `lower()` в SQLite кириллицу не берёт, а имена
-/// общих модулей кириллические.
-fn load_common_module_literal_missing_target_sites(
-    conn: &rusqlite::Connection,
-) -> rusqlite::Result<usize> {
-    let mut modules: HashSet<String> = HashSet::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT full_name_key FROM metadata_objects \
-             WHERE repo = ? AND meta_type = 'CommonModule'",
-        )?;
-        let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
-        for row in rows {
-            modules.insert(row?);
-        }
-    }
-    let mut missing = 0usize;
-    let mut stmt = conn.prepare(
-        "SELECT object_ref_key FROM metadata_code_usages \
-         WHERE repo = ? AND usage_kind = 'common_module_via_literal'",
-    )?;
-    let rows = stmt.query_map(params!["default"], |r| r.get::<_, String>(0))?;
-    for row in rows {
-        let key = row?;
-        if key.is_empty() {
-            continue;
-        }
-        if !modules.contains(&key) {
-            missing += 1;
-        }
-    }
-    Ok(missing)
-}
-
 /// Общий шаг канала общих модулей: какие ОБЩИЕ модули вообще есть в индексе и
 /// каким владельцам они соответствуют. Нужен и графу, и подпискам — оба
 /// источника резолвят цель в один и тот же `owner_key` (`commonmodule.x`).
@@ -1097,16 +1167,23 @@ fn load_common_module_hits(
     }
 
     // ОДИН проход по графу: какие объекты адресованы ВНЕШНИМИ рёбрами.
+    //
+    // Таблица читается ЦЕЛИКОМ (SCAN), а не поиском по частичному индексу
+    // `idx_pcg_callee_key`: индекс не покрывает `caller_proc_key`, поэтому поиск
+    // по нему тянет каждую строку из таблицы случайно (замер prod3: 205 мс
+    // против 125 мс у последовательного прохода). Строки без адреса цели
+    // (`callee_proc_key IS NULL`) отсеиваются в Rust.
     let mut hits: HashSet<String> = HashSet::new();
-    let mut stmt = conn.prepare(
-        "SELECT caller_proc_key, callee_proc_key FROM proc_call_graph \
-         WHERE repo = ? AND callee_proc_key IS NOT NULL",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT caller_proc_key, callee_proc_key FROM proc_call_graph WHERE repo = ?")?;
     let rows = stmt.query_map(params!["default"], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
     for row in rows {
         let (caller_key, callee_key) = row?;
+        let Some(callee_key) = callee_key else {
+            continue;
+        };
         let Some(callee_path) = proc_key_path(&callee_key) else {
             continue;
         };
@@ -1193,26 +1270,6 @@ fn proc_key_path(key: &str) -> Option<&str> {
     key.rfind("::").map(|i| &key[..i])
 }
 
-/// Есть ли в `metadata_code_usages` строки вида `usage_kind`? Пустая таблица —
-/// «судить не о чем» (true): свежая база без кода не должна давать оговорку.
-/// Аналог [`template_call_kinds_present`] для отдельного вида (Требование 0/2.3).
-fn usage_kind_present(conn: &rusqlite::Connection, kind: &str) -> rusqlite::Result<bool> {
-    let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ?",
-        params!["default"],
-        |r| r.get(0),
-    )?;
-    if total == 0 {
-        return Ok(true);
-    }
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ? AND usage_kind = ?",
-        params!["default", kind],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
 /// Материализован ли канал общих модулей: канал подтверждён ТОЛЬКО при
 /// `graph_rows > 0 && keyed > 0 && modules > 0` (в `proc_call_graph` есть хотя бы
 /// одно ребро с адресом цели `callee_proc_key`, а в `metadata_modules` — хотя бы
@@ -1251,32 +1308,6 @@ fn common_module_channel_present(conn: &rusqlite::Connection) -> rusqlite::Resul
         |r| r.get(0),
     )?;
     Ok(keyed > 0 && modules > 0)
-}
-
-/// Материализован ли канал макетов: в таблице есть строки, и среди них есть
-/// хотя бы одна строка нового вида ([`TEMPLATE_CALL_KINDS`]). Пустая таблица
-/// признаётся «судить не о чем» (true) — иначе свежая база без кода давала бы
-/// ложную оговорку.
-fn template_call_kinds_present(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
-    let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ?",
-        params!["default"],
-        |r| r.get(0),
-    )?;
-    if total == 0 {
-        return Ok(true);
-    }
-    let placeholders: Vec<&str> = TEMPLATE_CALL_KINDS.iter().map(|_| "?").collect();
-    let sql = format!(
-        "SELECT COUNT(*) FROM metadata_code_usages \
-         WHERE repo = ? AND usage_kind IN ({})",
-        placeholders.join(", ")
-    );
-    let mut args: Vec<&str> = Vec::with_capacity(TEMPLATE_CALL_KINDS.len() + 1);
-    args.push("default");
-    args.extend(TEMPLATE_CALL_KINDS.iter().copied());
-    let new_kinds: i64 = conn.query_row(&sql, params_from_iter(args), |r| r.get(0))?;
-    Ok(new_kinds > 0)
 }
 
 /// Папка выгрузки (plural, как в путях и `metadata_modules.object_name`) →

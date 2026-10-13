@@ -1844,47 +1844,17 @@ async fn find_unreferenced_objects_response_fits_requested_budget() {
     assert_eq!(raw["result"]["results_total"].as_u64(), Some(N as u64));
 }
 
-/// F2 (E-2): страж на уровне `execute` — утяжелённый обход обязан быть прерван
-/// таймером `execute` и вернуть ОШИБКУ, а не висеть до конца (и не отдать
-/// числа). Юнит-тест `blocking_query_is_interrupted_by_timer` проверяет только
-/// сам механизм `spawn_blocking` + `sqlite3_interrupt`; проводка таймера в
-/// `execute` проверяется здесь.
-///
-/// Обход делается заведомо дольше таймаута (`QUERY_TIMEOUT_SECS = 8`): у
-/// `metadata_code_usages` снят индекс `idx_mcu_ref`, поэтому корреляционный
-/// подзапрос обращений в `load_objects` вырождается в полный скан таблицы на
-/// КАЖДЫЙ объект (200 000 строк × 20 000 объектов ≈ 4·10⁹ сравнений строк — это
-/// десятки секунд, т.е. к моменту срабатывания таймера обход гарантированно
-/// внутри одного длинного запроса, а не в промежутке между ними). Прерывание
-/// доходит до `execute` ошибкой `OperationInterrupted` → ответ
-/// `{error: "database error: …"}`.
-///
-/// Тест намеренно дорогой (≈8 с): это РЕАЛЬНЫЙ таймаут инструмента, а не
-/// тестовый хук.
-///
-/// ВАЛИДНОСТЬ ЭТОГО ТЕСТА ДЕРЖИТСЯ НА ДВУХ ОПОРАХ (обе обязательны):
-///
-///   (а) РАНТАЙМ ТЕСТА — current-thread: у `#[tokio::test]` это дефолт, флаг
-///       `flavor = "multi_thread"` здесь ставить НЕЛЬЗЯ. На multi-thread таймер
-///       дёрнулся бы на другом воркере, даже если синхронный обход выполняется
-///       прямо на async-воркере (без `spawn_blocking`), и страж перестал бы
-///       ловить откат `spawn_blocking` — тест оставался бы зелёным на сломанном
-///       коде. На current-thread заблокированный единственный поток не даёт
-///       таймеру сработать, поэтому зелёный тест = таймер действительно
-///       выполнился и действительно прервал обход.
-///   (б) ИСКУССТВЕННО УТЯЖЕЛЁННЫЙ ОБХОД — снятый `idx_mcu_ref` (см. выше): без
-///       него `load_objects` идёт по seek'ам и обход укладывается в таймаут, т.е.
-///       тест ничего не проверял бы (нечего прерывать). Утяжеление — свойство
-///       фикстуры теста, а не продакшн-плана.
-///
-/// ОРИЕНТИР ПЕРЕСМОТРА: если изменится план/скорость обхода `load_objects` (SQL
-/// или индексы `metadata_code_usages`), значение `QUERY_TIMEOUT_SECS` или
-/// константы `OBJECTS`/`USAGES`, тест надо пересчитать так, чтобы обход был
-/// ЗАВЕДОМО дольше таймаута (сейчас — с большим запасом: ≈4·10⁹ сравнений строк
-/// против 8 с); одновременно проверить, что нижняя граница `elapsed >= 7 с`
-/// по-прежнему означает «сработал таймер», а не «завис».
+/// D2 (E-11): тот же утяжелённый обход, на котором раньше доказывалась работа
+/// таймера, теперь обязан ЗАВЕРШИТЬСЯ и отдать числа — без срабатывания
+/// `execute`-таймера. У `metadata_code_usages` по-прежнему снят `idx_mcu_ref`
+/// (фикстура та же), но обход больше НЕ зависит от этого индекса: виды
+/// обращений приходят ОДНИМ проходом (`load_usage_index`), а не коррелированным
+/// `GROUP_CONCAT` на каждый объект. На прежнем коде этот же тест падал: обход
+/// (200 000 строк × 20 000 объектов) не укладывался в `QUERY_TIMEOUT_SECS = 8`,
+/// таймер прерывал запрос, и инструмент возвращал `{error: "database error: …"}`
+/// вместо чисел.
 #[tokio::test]
-async fn find_unreferenced_objects_execute_interrupts_heavy_scan() {
+async fn find_unreferenced_objects_heavy_scan_completes_without_interrupt() {
     const OBJECTS: usize = 20_000;
     const USAGES: usize = 200_000;
     let (_tmp, storage) = fresh_storage();
@@ -1929,6 +1899,122 @@ async fn find_unreferenced_objects_execute_interrupts_heavy_scan() {
             }
         }
         bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+        conn.execute("COMMIT", []).unwrap();
+    }
+
+    let t = Instant::now();
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    let elapsed = t.elapsed();
+    println!("E-11 heavy scan without idx_mcu_ref: elapsed={elapsed:?} res={res}");
+    assert!(
+        res["error"].is_null(),
+        "обход обязан уложиться в таймаут и отдать числа, а не ошибку: {res}"
+    );
+    assert_eq!(
+        res["results_total"].as_u64(),
+        Some(0),
+        "у каждого объекта есть обращение в коде — «мёртвых» нет: {res}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "обход обязан закончиться ДО таймера (иначе числа могли прийти из \
+         незавершённого прохода): {elapsed:?}"
+    );
+}
+
+/// F2 (E-2): страж на уровне `execute` — утяжелённый обход обязан быть прерван
+/// таймером `execute` и вернуть ОШИБКУ, а не висеть до конца (и не отдать
+/// числа). Юнит-тест `blocking_query_is_interrupted_by_timer` проверяет только
+/// сам механизм `spawn_blocking` + `sqlite3_interrupt`; проводка таймера в
+/// `execute` проверяется здесь.
+///
+/// Вес даёт КВАДРАТИЧНОЕ место внутри обхода, которое сохраняется на любом
+/// плане: канал общих модулей проверяет «внешность» ребра перебором ВСЕХ путей
+/// модуля (`load_common_module_hits`, E-4). У одного общего модуля здесь 20 000
+/// путей с длинным общим префиксом, и каждое из 30 000 self-рёбер дочитывает
+/// список путей до последнего элемента (≈20 000 сравнений строк по ~44 байта) —
+/// десятки секунд, т.е. к моменту срабатывания таймера обход гарантированно
+/// внутри одного запроса, а не в промежутке между ними. Прерывание доходит до
+/// `execute` ошибкой `OperationInterrupted` → ответ `{error: "database error: …"}`.
+///
+/// ВАЛИДНОСТЬ ЭТОГО ТЕСТА ДЕРЖИТСЯ НА ДВУХ ОПОРАХ (обе обязательны):
+///
+///   (а) РАНТАЙМ ТЕСТА — current-thread: у `#[tokio::test]` это дефолт, флаг
+///       `flavor = "multi_thread"` здесь ставить НЕЛЬЗЯ. На multi-thread таймер
+///       дёрнулся бы на другом воркере, даже если синхронный обход выполняется
+///       прямо на async-воркере (без `spawn_blocking`), и страж перестал бы
+///       ловить откат `spawn_blocking` — тест оставался бы зелёным на сломанном
+///       коде. На current-thread заблокированный единственный поток не даёт
+///       таймеру сработать, поэтому зелёный тест = таймер действительно
+///       выполнился и действительно прервал обход.
+///   (б) ИСКУССТВЕННО УТЯЖЕЛЁННЫЙ ОБХОД — 20 000 путей одного общего модуля и
+///       30 000 self-рёбер: утяжеление — свойство фикстуры теста, а не
+///       продакшн-плана (до ребейза вес давало снятие `idx_mcu_ref`; после
+///       сведения запросов обхода этот приём перестал утяжелять проход — см.
+///       `…_heavy_scan_completes_without_interrupt`).
+///
+/// ОРИГИНАЛ ПЕРЕСМОТРА: если `load_common_module_hits` перестанет перебирать
+/// пути владельца (например, заменит перебор на множество) или изменится
+/// `QUERY_TIMEOUT_SECS`, фикстуру надо пересчитать так, чтобы обход был
+/// ЗАВЕДОМО дольше таймаута; одновременно проверить, что нижняя граница
+/// `elapsed >= 7 с` по-прежнему означает «сработал таймер», а не «завис».
+#[tokio::test]
+async fn find_unreferenced_objects_execute_interrupts_heavy_scan() {
+    const PATHS: usize = 20_000;
+    const EDGES: usize = 30_000;
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    let path = |i: usize| format!("blocks/deep/extension/segment/of/module/paths/{i:05}");
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute("BEGIN", []).unwrap();
+        {
+            let mut module = conn
+                .prepare(
+                    "INSERT INTO metadata_modules \
+                     (repo, full_name, object_name, module_type, object_id, property_id, \
+                      code_path, extension_name) \
+                     VALUES ('default', ?1, 'CommonModules.ТяжёлыйМодуль', 'Module', ?4, '', ?2, ?3)",
+                )
+                .unwrap();
+            for i in 0..PATHS {
+                // extension_name задаёт порядок обхода путей владельца
+                // (`ORDER BY object_name, extension_name`): путь с наибольшим
+                // номером дочитывается перебором ДО КОНЦА.
+                module
+                    .execute(params![
+                        format!("CommonModules.ТяжёлыйМодуль.Module{i:05}"),
+                        path(i),
+                        format!("{i:05}"),
+                        format!("obj{i:05}")
+                    ])
+                    .unwrap();
+            }
+        }
+        {
+            let mut edge = conn
+                .prepare(
+                    "INSERT INTO proc_call_graph \
+                     (repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type) \
+                     VALUES ('default', ?1, 'Метод', ?2, 'direct')",
+                )
+                .unwrap();
+            let path_key = path(PATHS - 1);
+            for i in 0..EDGES {
+                // caller == callee: ребро внутри модуля (self) — владелец
+                // использованием не считается, и перебор путей повторяется на
+                // каждом ребре. Имена методов разные: у `proc_call_graph` UNIQUE
+                // по (repo, caller_proc_key, callee_proc_name, call_type).
+                let key = format!("{path_key}::Метод{i}");
+                edge.execute(params![key, key]).unwrap();
+            }
+        }
         conn.execute("COMMIT", []).unwrap();
     }
 

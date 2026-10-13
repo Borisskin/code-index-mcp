@@ -24,9 +24,18 @@
 // metadata_code_usages + bsl_sql по role_rights) одним компактным ответом —
 // «карта влияния» объекта: что сломается/затронется при его изменении.
 //
-// Счётчики (total + разбивка по видам) считаются точно; примеры (sample)
-// ограничены `limit` на секцию (по умолчанию 20), чтобы ответ оставался лёгким
-// для часто-ссылаемых объектов (Контрагенты, Номенклатура — тысячи ссылок).
+// Счётчики (total + разбивка по видам) считаются точно по строкам
+// `metadata_code_usages`; примеры (sample) ограничены `limit` на секцию (по
+// умолчанию 20), чтобы ответ оставался лёгким для часто-ссылаемых объектов
+// (Контрагенты, Номенклатура — тысячи ссылок).
+//
+// Выдача строк (sample и страницы секции `code_usages`) дедуплицируется по
+// ОДНОМУ КОД-САЙТУ (`file_path`, `line`): после сведения макетных каналов один
+// сайт даёт ДВЕ строки разных семейств — upstream `manager` (`Справочники.X`) и
+// наш `template_call_via_manager` (`Справочники.X.ПолучитьМакет("Y")`), а также
+// upstream `picture` и наш `common_picture` для `БиблиотекаКартинок.X`. В
+// выдаче остаётся более специфичный вид (см. [`SITE_RANK_SQL`]); счётчики
+// секции при этом остаются по строкам индекса (Требование: не менять числа).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -41,6 +50,15 @@ const MAX_LIMIT: i64 = 200;
 /// Таймаут набора запросов (как в bsl_sql): по истечении sqlite3_interrupt
 /// обрывает runaway COUNT/GROUP BY на центральных объектах (десятки тысяч рёбер).
 const QUERY_TIMEOUT_SECS: u64 = 8;
+
+/// Ранг строки внутри одного код-сайта (`file_path`, `line`) для дедупликации
+/// выдачи (D1): обобщённые виды upstream (`manager` — обращение к менеджеру
+/// коллекции, `picture` — обращение к библиотеке картинок) уступают
+/// специфичным (`template_call*` — вызов макета, `common_picture`,
+/// `style_item`). Внутри одного ранга порядок добивается `usage_kind` и
+/// `member_path` — дедуп детерминирован.
+const SITE_RANK_SQL: &str =
+    "CASE WHEN usage_kind IN ('manager','picture') THEN 1 ELSE 0 END, usage_kind, member_path";
 
 pub struct FindReferencesTool;
 
@@ -61,7 +79,11 @@ impl IndexTool for FindReferencesTool {
          объекта); role_rights — какие \
          роли выдают права на объект. Использование макетов (ПолучитьМакет/\
          ПолучитьОбщийМакет, в т.ч. без владельца в object_ref) адресуй через \
-         find_unreferenced_objects. У каждой \
+         find_unreferenced_objects. Строки code_usages выдаются по одному \
+         код-сайту (file_path, line): если на одном сайте есть и обобщённый вид \
+         (manager/picture), и специфичный (template_call*/common_picture/\
+         style_item), в выдаче остаётся специфичный; total и by_usage_kind при \
+         этом считают строки индекса. У каждой \
          секции total + разбивка по видам + примеры (sample, ограничены параметром \
          limit). Объект задаётся канонически: 'Document.РеализацияТоваровУслуг', \
          'Catalog.Контрагенты', 'AccumulationRegister.ТоварыНаСкладах'. Реверс \
@@ -167,7 +189,7 @@ impl IndexTool for FindReferencesTool {
                 let page = query_section_page(conn, &object_key, section, offset, budget.applied);
                 timer.abort();
                 return match page {
-                    Ok(Some((items, page))) => {
+                    Ok(Some(SectionPage { items, page, next })) => {
                         let mut out = json!({
                             "object": object,
                             "section": section,
@@ -175,7 +197,7 @@ impl IndexTool for FindReferencesTool {
                         });
                         if let Some(obj) = out.as_object_mut() {
                             page.annotate(obj, "items");
-                            if let Some(next) = page.next_offset() {
+                            if let Some(next) = next {
                                 let call = code_index_core::mcp::cap::next_call_hint(
                                     "find_references",
                                     &[
@@ -257,25 +279,27 @@ const PAGE_ROWS: i64 = 2_000;
 /// Одна секция карты влияния целиком, страницами по размеру ответа.
 /// `None` — неизвестное имя секции. Смещение применяется в SQL, а бюджет —
 /// уже к вынутым строкам: сколько поместилось, столько и отдаём.
+///
+/// `next` — смещение СЛЕДУЮЩЕГО вызова. Для `code_usages` оно считается по
+/// СЫРЫМ строкам (см. [`query_code_usages_section`]), поэтому не равно
+/// `page.next_offset()`: дедуп по сайту уменьшает число отданных строк, но не
+/// сдвигает курсор набора.
 fn query_section_page(
     conn: &rusqlite::Connection,
     object_key: &str,
     section: &str,
     offset: usize,
     budget: usize,
-) -> rusqlite::Result<Option<(Value, code_index_core::mcp::cap::Page)>> {
+) -> rusqlite::Result<Option<SectionPage>> {
+    if section == "code_usages" {
+        return query_code_usages_section(conn, object_key, offset, budget).map(Some);
+    }
     let (count_sql, rows_sql) = match section {
         "data_refs" => (
             "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND to_object_key = ?2",
             "SELECT from_object, from_path, link_kind FROM data_links \
              WHERE repo = ?1 AND to_object_key = ?2 \
              ORDER BY link_kind, from_object LIMIT ?3 OFFSET ?4",
-        ),
-        "code_usages" => (
-            "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ?1 AND object_ref_key = ?2",
-            "SELECT file_path, line, usage_kind, member_path FROM metadata_code_usages \
-             WHERE repo = ?1 AND object_ref_key = ?2 \
-             ORDER BY usage_kind, file_path, line LIMIT ?3 OFFSET ?4",
         ),
         "role_rights" => (
             "SELECT COUNT(*) FROM role_rights WHERE repo = ?1 AND object_name_key = ?2",
@@ -297,12 +321,6 @@ fn query_section_page(
                     "from_path": r.get::<_, String>(1)?,
                     "link_kind": r.get::<_, String>(2)?,
                 }),
-                "code_usages" => json!({
-                    "file_path": r.get::<_, String>(0)?,
-                    "line": r.get::<_, i64>(1)?,
-                    "usage_kind": r.get::<_, String>(2)?,
-                    "member_path": r.get::<_, Option<String>>(3)?,
-                }),
                 _ => json!({
                     "role_name": r.get::<_, String>(0)?,
                     "right_name": r.get::<_, String>(1)?,
@@ -322,8 +340,88 @@ fn query_section_page(
     page.offset = offset;
     page.total = total.max(0) as usize;
     page.has_more = offset + shown < page.total;
+    let next = page.next_offset();
     let items = std::mem::take(&mut page.items);
-    Ok(Some((Value::Array(items), page)))
+    Ok(Some(SectionPage {
+        items: Value::Array(items),
+        page,
+        next,
+    }))
+}
+
+/// Страница секции `code_usages`: строки-обращения дедуплицируются по одному
+/// код-сайту (`file_path`, `line`) с приоритетом специфичного вида (D1), а
+/// `offset` — курсор по СЫРЫМ строкам набора (`raw_pos` из оконной функции):
+/// так обход не пропускает и не повторяет сайты, а счётчик `items_total`
+/// остаётся числом строк индекса (как и `by_usage_kind` в обычном режиме).
+fn query_code_usages_section(
+    conn: &rusqlite::Connection,
+    object_key: &str,
+    offset: usize,
+    budget: usize,
+) -> rusqlite::Result<SectionPage> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ?1 AND object_ref_key = ?2",
+        params!["default", object_key],
+        |r| r.get(0),
+    )?;
+    let sql = format!(
+        "SELECT file_path, line, usage_kind, member_path, raw_pos FROM ( \
+             SELECT file_path, line, usage_kind, member_path, \
+                ROW_NUMBER() OVER (ORDER BY usage_kind, file_path, line) AS raw_pos, \
+                ROW_NUMBER() OVER (PARTITION BY file_path, line ORDER BY {SITE_RANK_SQL}) \
+                    AS site_rank \
+             FROM metadata_code_usages WHERE repo = ?1 AND object_ref_key = ?2 \
+         ) WHERE site_rank = 1 AND raw_pos > ?3 ORDER BY raw_pos LIMIT ?4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params!["default", object_key, offset as i64, PAGE_ROWS],
+        |r| {
+            Ok((
+                json!({
+                    "file_path": r.get::<_, String>(0)?,
+                    "line": r.get::<_, i64>(1)?,
+                    "usage_kind": r.get::<_, String>(2)?,
+                    "member_path": r.get::<_, Option<String>>(3)?,
+                }),
+                r.get::<_, i64>(4)?,
+            ))
+        },
+    )?;
+    // Сырая позиция каждой отданной строки нужна, чтобы сдвинуть курсор на
+    // последнюю из них (а не на число показанных строк).
+    let mut rows_with_pos: Vec<(Value, i64)> = Vec::new();
+    for row in rows {
+        rows_with_pos.push(row?);
+    }
+    let items: Vec<Value> = rows_with_pos.iter().map(|(v, _)| v.clone()).collect();
+
+    let mut page = code_index_core::mcp::cap::page_by_bytes(items, 0, budget);
+    let shown = page.shown;
+    let last_raw = if shown == 0 {
+        None
+    } else {
+        Some(rows_with_pos[shown - 1].1.max(0) as usize)
+    };
+    page.offset = offset;
+    page.total = total.max(0) as usize;
+    page.has_more = last_raw.is_some_and(|p| p < page.total);
+    let next = if page.has_more { last_raw } else { None };
+    let items = std::mem::take(&mut page.items);
+    Ok(SectionPage {
+        items: Value::Array(items),
+        page,
+        next,
+    })
+}
+
+/// Итог страницы секции: элементы, аннотация страницы и смещение следующего
+/// вызова (`None` — набор кончился).
+struct SectionPage {
+    items: Value,
+    page: code_index_core::mcp::cap::Page,
+    next: Option<usize>,
 }
 
 /// Структурные ссылки на объект (реверс data_links по to_object).
@@ -395,12 +493,20 @@ fn query_code_usages(
             by_kind.insert(kind, json!(cnt));
         }
     }
+    // Выдача примеров дедуплицируется по одному код-сайту (`file_path`,
+    // `line`) с приоритетом специфичного вида (D1); `total` и `by_usage_kind`
+    // выше остаются по строкам индекса (числа не меняются).
+    let sql = format!(
+        "SELECT file_path, line, usage_kind, member_path FROM ( \
+             SELECT file_path, line, usage_kind, member_path, \
+                ROW_NUMBER() OVER (PARTITION BY file_path, line ORDER BY {SITE_RANK_SQL}) \
+                    AS site_rank \
+             FROM metadata_code_usages WHERE repo = ?1 AND object_ref_key = ?2 \
+         ) WHERE site_rank = 1 ORDER BY usage_kind, file_path, line LIMIT ?3"
+    );
     let mut sample = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT file_path, line, usage_kind, member_path FROM metadata_code_usages \
-             WHERE repo = ?1 AND object_ref_key = ?2 ORDER BY usage_kind, file_path, line LIMIT ?3",
-        )?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params!["default", object_key, limit], |r| {
             Ok(json!({
                 "file_path": r.get::<_, String>(0)?,
@@ -515,28 +621,27 @@ mod tests {
         }
 
         // Первая страница ограничена бюджетом, но знает полный размер набора.
-        let (items, page) = query_section_page(&conn, "catalog.организации", "data_refs", 0, 4_000)
+        let page = query_section_page(&conn, "catalog.организации", "data_refs", 0, 4_000)
             .unwrap()
             .expect("секция известна");
-        let shown = page.shown;
+        let shown = page.page.shown;
         assert!(shown > 0 && shown < 120, "страница по бюджету: {shown}");
-        assert_eq!(page.total, 120);
-        assert_eq!(page.offset, 0);
-        assert!(page.has_more);
-        assert_eq!(page.next_offset(), Some(shown));
-        assert_eq!(items.as_array().unwrap().len(), shown);
+        assert_eq!(page.page.total, 120);
+        assert_eq!(page.page.offset, 0);
+        assert!(page.page.has_more);
+        assert_eq!(page.next, Some(shown));
+        assert_eq!(page.items.as_array().unwrap().len(), shown);
 
         // Продолжение со смещения доходит до конца.
         let mut offset = shown;
         let mut guard = 0;
         while guard < 20 {
             guard += 1;
-            let (_, p) =
-                query_section_page(&conn, "catalog.организации", "data_refs", offset, 4_000)
-                    .unwrap()
-                    .unwrap();
-            offset += p.shown;
-            if !p.has_more {
+            let p = query_section_page(&conn, "catalog.организации", "data_refs", offset, 4_000)
+                .unwrap()
+                .unwrap();
+            offset += p.page.shown;
+            if !p.page.has_more {
                 break;
             }
         }
@@ -547,6 +652,116 @@ mod tests {
             query_section_page(&conn, "catalog.организации", "нет", 0, 4_000)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// D1: один код-сайт после сведения макетных каналов даёт ДВЕ строки разных
+    /// семейств (upstream `manager` + наш `template_call_via_manager`, upstream
+    /// `picture` + наш `common_picture`). В выдаче остаётся одна строка — с более
+    /// специфичным видом; `total`/`by_usage_kind` (обычный режим) и `items_total`
+    /// (секция) остаются по строкам индекса, а курсор обхода секции идёт по
+    /// СЫРЫМ строкам: ни один сайт не выпадает и не повторяется.
+    #[test]
+    fn code_usages_are_deduped_by_site_with_specific_kind_preferred() {
+        use std::collections::HashSet;
+
+        let conn = mem();
+        let key = "catalog.валюты";
+        let rows = [
+            (
+                "Forms/ПодборВалют.bsl",
+                47,
+                "manager",
+                Some("ОбщероссийскийКлассификаторВалют"),
+            ),
+            (
+                "Forms/ПодборВалют.bsl",
+                47,
+                "template_call_via_manager",
+                Some("ОбщероссийскийКлассификаторВалют"),
+            ),
+            ("CommonModules/Х.bsl", 3, "picture", Some("Логотип")),
+            ("CommonModules/Х.bsl", 3, "common_picture", None),
+            ("CommonModules/Х.bsl", 9, "manager", None),
+        ];
+        for (file, line, kind, member) in rows {
+            conn.execute(
+                "INSERT INTO metadata_code_usages \
+                 (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+                 VALUES ('default', 'Catalog.Валюты', ?1, ?2, ?3, ?4, ?5)",
+                params![key, member, kind, file, line],
+            )
+            .unwrap();
+        }
+
+        // Обычный режим: примеры — по одному на сайт, счётчики — по строкам.
+        let r = query_code_usages(&conn, key, 20).unwrap();
+        assert_eq!(r["total"], json!(5), "total считает строки индекса");
+        assert_eq!(r["by_usage_kind"]["manager"], json!(2));
+        let sample = r["sample"].as_array().unwrap();
+        assert_eq!(sample.len(), 3, "три уникальных сайта: {sample:?}");
+        let kind_at = |file: &str, line: i64| -> String {
+            sample
+                .iter()
+                .find(|it| it["file_path"] == json!(file) && it["line"] == json!(line))
+                .unwrap_or_else(|| panic!("сайт {file}:{line} отсутствует в примерах: {sample:?}"))
+                ["usage_kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            kind_at("Forms/ПодборВалют.bsl", 47),
+            "template_call_via_manager",
+            "специфичный вид важнее manager"
+        );
+        assert_eq!(
+            kind_at("CommonModules/Х.bsl", 3),
+            "common_picture",
+            "common_picture важнее picture"
+        );
+        assert_eq!(
+            kind_at("CommonModules/Х.bsl", 9),
+            "manager",
+            "обобщённый вид без пары остаётся"
+        );
+
+        // Секция целиком: тот же дедуп, `items_total` — строки индекса.
+        let page = query_code_usages_section(&conn, key, 0, 1_000_000).unwrap();
+        assert_eq!(page.page.total, 5, "items_total считает строки индекса");
+        assert_eq!(page.page.shown, 3);
+        assert!(!page.page.has_more);
+        assert_eq!(page.next, None);
+        assert_eq!(page.items.as_array().unwrap().len(), 3);
+
+        // Обход секции с крошечным бюджетом (одна строка на страницу): каждый
+        // сайт выдан ровно один раз, обход завершается.
+        let mut seen: Vec<(String, i64)> = Vec::new();
+        let mut offset = 0usize;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 10, "обход должен завершиться: {seen:?}");
+            let p = query_code_usages_section(&conn, key, offset, 200).unwrap();
+            for it in p.items.as_array().unwrap() {
+                seen.push((
+                    it["file_path"].as_str().unwrap().to_string(),
+                    it["line"].as_i64().unwrap(),
+                ));
+            }
+            match p.next {
+                Some(next) => {
+                    assert!(next > offset, "курсор двигается вперёд ({next} > {offset})");
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 3, "сайтов ровно три: {seen:?}");
+        assert_eq!(
+            seen.iter().collect::<HashSet<_>>().len(),
+            3,
+            "повторов нет: {seen:?}"
         );
     }
 }
