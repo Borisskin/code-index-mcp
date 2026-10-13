@@ -5,7 +5,7 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.12.0] — 2026-10-14
 
 **Objects with no references: which references were counted, which forms are not indexed, and why "no references" is not a verdict.**
 

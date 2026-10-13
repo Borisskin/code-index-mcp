@@ -301,7 +301,7 @@ pub fn bulk_load_in_progress(conn: &rusqlite::Connection) -> bool {
 /// читается, — но граф в ней собран по прежним правилам, и инструменты ответят
 /// по ней «вызывающих нет» там, где привязка есть. Такую базу нужно один раз
 /// пересобрать: `index --force`.
-pub const INDEX_DATA_VERSION: u32 = 2;
+pub const INDEX_DATA_VERSION: u32 = 3;
 
 /// Ключ номера версии данных в таблице `index_state`.
 pub const DATA_VERSION_KEY: &str = "index_data_version";
