@@ -542,10 +542,7 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //   * `member_path`    — имя ТЧ для `query` (3-й сегмент пути), имя макета
     //     для `template_call`/`common_template_call`, иначе NULL.
     //   * `usage_kind`     — `manager` (Документы.X) | `ref_type` ("ДокументСсылка.X")
-    //     | `query` (путь метаданных в тексте запроса) | `template`
-    //     (макет объекта, object_ref = `<Тип>.<Объект>.Template.<Имя>`) |
-    //     `common_template` (object_ref = `CommonTemplate.<Имя>`) | `picture`
-    //     (object_ref = `CommonPicture.<Имя>`) | `template_call`
+    //     | `query` (путь метаданных в тексте запроса) | `template_call`
     //     (`ПолучитьМакет("X")`, object_ref = "Template") | `common_template_call`
     //     (`ПолучитьОбщийМакет("X")`, object_ref = "CommonTemplate") |
     //     `template_call_via_manager` (`Справочники.X.ПолучитьМакет("Y")`,

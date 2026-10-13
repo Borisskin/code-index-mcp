@@ -78,10 +78,7 @@ impl ParseExtrasCollector for BslParseCollector {
         }
 
         // Слой 1: обращения к объектам МД → metadata_code_usages.
-        let usages = extract_code_usages_for_index(
-            ctx.content,
-            crate::code_usages::owner_ref_from_path(ctx.rel_path).as_deref(),
-        );
+        let usages = extract_code_usages_for_index(ctx.content);
         if !usages.is_empty() {
             self.code_usages
                 .lock()

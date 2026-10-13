@@ -78,13 +78,10 @@ impl IndexTool for BslSqlTool {
          metadata_code_usages(object_ref, object_ref_key, member_path, usage_kind, file_path, line; \
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
          object_ref_key уже в нижнем регистре для поиска из приложения; \
-         usage_kind: manager | ref_type | query | template | common_template | picture | \
+         usage_kind: manager | ref_type | query | \
          common_picture | style_item | template_call | \
          common_template_call | template_call_via_manager | template_call_via_receiver | \
          common_module_via_literal; \
-         template — макет объекта (object_ref = '<Тип>.<Объект>.Template.<Имя>'); \
-         common_template — общий макет (object_ref = 'CommonTemplate.<Имя>'); \
-         picture — обращение к общей картинке из кода (object_ref = 'CommonPicture.<Имя>'); \
          common_picture — обращение к общей картинке (object_ref = 'CommonPicture.X': \
          'БиблиотекаКартинок.X'/'CommonPicture.X' из кода и CommonPicture.X из XML выгрузки); \
          style_item — обращение к элементу стиля (object_ref = 'StyleItem.X': \

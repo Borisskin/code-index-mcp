@@ -13,9 +13,6 @@
 //     либо `"DocumentRef.X"` (EN);
 //   * `query`    — путь метаданных в строковом литерале (текст запроса):
 //     `Документ.X` и `Документ.X.Товары` (3-й сегмент = имя ТЧ → `member_path`).
-//   * `template` / `common_template` / `picture` — макет объекта по `owner_ref`
-//     пути модуля, `ПолучитьОбщийМакет("X")` и `БиблиотекаКартинок.X`
-//     (каналы релиза 1.10.0, `collect_template_usage`).
 //
 // Ветки `template_call*`, `common_picture`, `style_item`,
 // `common_module_via_literal` разбирает [`extract_extra_usages`]: они
@@ -899,12 +896,12 @@ pub const QUERY_VIRTUAL_TABLES: &[&str] = &[
 
 /// Извлечь обращения к объектам метаданных из тела `.bsl`-модуля.
 ///
-/// `owner_ref` — каноническая ссылка на объект-владельца модуля
-/// (`Catalog.ВидыДокументовЭДОБЗК`; см. [`owner_ref_from_path`]). Она нужна
-/// макетам: `ПолучитьМакет("Классификатор")` в модуле объекта означает макет
-/// ЭТОГО объекта. Владельца нет (общий модуль, общая форма) — обращение к
-/// макету не записывается: приписать макет чужому объекту хуже, чем пропустить.
-pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUsage> {
+/// Базовые каналы: `manager` (пары «коллекция.объект» в коде), `ref_type` и
+/// `query` (пути метаданных в строковых литералах). Каналы по строковым
+/// аргументам (`ПолучитьМакет`/`ОбщийМодуль`, «библиотеки» картинок и стиля)
+/// живут в [`extract_extra_usages`]; индексатор складывает оба набора через
+/// [`extract_code_usages_for_index`].
+pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
     let mut out: Vec<CodeUsage> = Vec::new();
     let mut in_string = false;
 
@@ -922,11 +919,6 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
                 }
             }
         }
-
-        // Макеты и картинки: имя объекта стоит не в коде, а в аргументе-литерале
-        // (`ПолучитьМакет("Классификатор")`), поэтому обычный разбор пар
-        // «идентификатор.идентификатор» их не видит.
-        collect_template_usage(&code, raw, owner_ref, lineno, &mut out);
 
         // ref_type / query — только внутри строковых литералов.
         for content in &strings {
@@ -949,12 +941,10 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
             }
         }
 
-        // NB: дополнительные каналы (голая/метод-формы `ПолучитьМакет`,
-        // `ОбщийМодуль("Имя")`, «библиотеки» картинок и стиля) живут в
-        // [`extract_extra_usages`]: они пересекаются с макетным каналом этой
-        // функции по входу, и два независимых разбора одного вызова не
-        // складываются в один набор — индексатор берёт оба набора через
-        // [`extract_code_usages_for_index`].
+        // NB: каналы по строковому аргументу (голая/метод-формы
+        // `ПолучитьМакет`, `ОбщийМодуль("Имя")`, «библиотеки» картинок и стиля)
+        // живут в [`extract_extra_usages`]; индексатор собирает оба набора
+        // через [`extract_code_usages_for_index`].
     }
     out
 }
@@ -966,8 +956,8 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
 /// Оба набора не пересекаются по `usage_kind`, поэтому потребители
 /// (`find_references`, `find_unreferenced_objects`, `get_object_profile`)
 /// видят каждый канал ровно один раз, фильтруя по своему виду обращения.
-pub fn extract_code_usages_for_index(content: &str, owner_ref: Option<&str>) -> Vec<CodeUsage> {
-    let mut out = extract_code_usages(content, owner_ref);
+pub fn extract_code_usages_for_index(content: &str) -> Vec<CodeUsage> {
+    let mut out = extract_code_usages(content);
     out.extend(extract_extra_usages(content));
     out
 }
@@ -982,10 +972,9 @@ pub fn extract_code_usages_for_index(content: &str, owner_ref: Option<&str>) -> 
 ///   * `common_picture` / `style_item` — `БиблиотекаКартинок.X`,
 ///     `ЦветаСтиля.X`, `ШрифтыСтиля.X` (фильтр «метод/поле»).
 ///
-/// Отдельная функция, а не ветка [`extract_code_usages`]: у той же самой
-/// строки макетный/картиночный канал уже разбирается в
-/// [`collect_template_usage`] (он резолвит владельца по `owner_ref`), и второй
-/// разбор внутри одного набора дал бы двойные записи об одном обращении.
+/// Отдельная функция, а не ветка [`extract_code_usages`]: наборы различаются
+/// по виду каналов (здесь — вызовы по строковому аргументу и «библиотеки»),
+/// и индексатор складывает их через [`extract_code_usages_for_index`].
 pub fn extract_extra_usages(content: &str) -> Vec<CodeUsage> {
     let mut out: Vec<CodeUsage> = Vec::new();
     let mut in_string = false;
@@ -1029,150 +1018,6 @@ pub fn extract_extra_usages(content: &str) -> Vec<CodeUsage> {
         out.extend(common_module_literals(&code, &strings, lineno));
     }
     out
-}
-
-/// Каноническая ссылка на объект-владельца модуля по пути выгрузки:
-/// `base/Catalogs/ВидыДокументовЭДОБЗК/Ext/ManagerModule.bsl` →
-/// `Catalog.ВидыДокументовЭДОБЗК`.
-///
-/// Модуль формы принадлежит тому же владельцу, что и объект:
-/// `.../X/Forms/Ф/Ext/Form/Module.bsl` → `...X`. Берётся БЛИЖАЙШАЯ к файлу пара
-/// «папка метаданных + объект» — так же работает и вложенная раскладка
-/// расширений (`extensions/Расш/Catalogs/X/...`).
-///
-/// `None` — владелец не выводится: у общих модулей, общих форм и прочих
-/// объектов, которые макетов не имеют, ссылку собирать не из чего.
-pub fn owner_ref_from_path(rel_path: &str) -> Option<String> {
-    let parts: Vec<&str> = rel_path.split('/').collect();
-    let mut found: Option<String> = None;
-    for (i, seg) in parts.iter().enumerate() {
-        let low = seg.to_lowercase();
-        let hit = META_FORMS
-            .iter()
-            .find(|m| m.ru_plural.to_lowercase() == low || m.en_plural.to_lowercase() == low);
-        if let (Some(m), Some(name)) = (hit, parts.get(i + 1)) {
-            found = Some(format!("{}.{}", m.canonical, name));
-        }
-    }
-    found
-}
-
-/// Аргумент-литерал вызова: `ПолучитьМакет("Имя")` → `Имя`.
-///
-/// Ищется ровно шаблон `<вызов>(` + кавычка, и разбор идёт по исходной строке
-/// (с комментариями), поэтому решение о том, что вызов настоящий, принимает
-/// вызывающий — он проверяет имя вызова в очищенном коде. Литерал «где-то в
-/// строке» не годится: он давал бы ложную связь на макет, а ложная связь хуже
-/// пропуска — макет выглядел бы используемым.
-fn argument_literal(raw: &str, call: &str) -> Option<String> {
-    let low = raw.to_lowercase();
-    let call_low = call.to_lowercase();
-    let mut from = 0usize;
-    while let Some(pos) = low[from..].find(&call_low) {
-        let start = from + pos + call_low.len();
-        let rest = raw.get(start..)?;
-        let rest = rest.trim_start();
-        if let Some(rest) = rest.strip_prefix('(') {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix('"') {
-                if let Some(end) = rest.find('"') {
-                    let name = &rest[..end];
-                    if !name.is_empty() {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        from = start;
-        if from >= low.len() {
-            break;
-        }
-    }
-    None
-}
-
-/// Приёмник вызова у макета: `Справочники.X.ПолучитьМакет(...)` → `Catalog.X`.
-/// Так макет того же объекта берут из общего модуля — владельца модуля там нет.
-fn qualified_template_owner(code: &str) -> Option<String> {
-    for (g1, g2, g3) in path_triples(code) {
-        if !g3
-            .as_deref()
-            .is_some_and(|m| m.eq_ignore_ascii_case("ПолучитьМакет"))
-        {
-            continue;
-        }
-        if let Some(&canon) = manager_map().get(&g1.to_lowercase()) {
-            return Some(format!("{canon}.{g2}"));
-        }
-    }
-    None
-}
-
-/// Собрать обращения к макетам и общим картинкам из одной строки модуля.
-///
-/// Это единственный вид обращений, где имя объекта лежит в строковом литерале,
-/// а не в коде. До этого канала макеты выглядели неиспользуемыми: на живой
-/// конфигурации таких «мёртвых» макетов было больше тысячи, и вывод «макет
-/// можно удалить» был неверным.
-fn collect_template_usage(
-    code: &str,
-    raw: &str,
-    owner_ref: Option<&str>,
-    line: usize,
-    out: &mut Vec<CodeUsage>,
-) {
-    let low = code.to_lowercase();
-
-    // Общий макет: владелец не нужен, имя уникально в конфигурации.
-    if low.contains("получитьобщиймакет") {
-        if let Some(name) = argument_literal(raw, "ПолучитьОбщийМакет") {
-            out.push(make_nested_usage(
-                format!("CommonTemplate.{name}"),
-                "common_template",
-                line,
-            ));
-        }
-    }
-
-    // Макет объекта: владелец — сам объект модуля либо приёмник вызова.
-    if low.contains("получитьмакет") {
-        if let Some(name) = argument_literal(raw, "ПолучитьМакет") {
-            if let Some(owner) =
-                qualified_template_owner(code).or_else(|| owner_ref.map(str::to_string))
-            {
-                if let Some((canon, obj)) = owner.split_once('.') {
-                    out.push(make_nested_usage(
-                        format!("{canon}.{obj}.Template.{name}"),
-                        "template",
-                        line,
-                    ));
-                }
-            }
-        }
-    }
-
-    // Общая картинка: `БиблиотекаКартинок.Имя` — свойство, а не вызов.
-    if code.contains('.') {
-        // Третий элемент пары (признак «метод/поле», см. [`dotted_pairs`]) здесь
-        // не используется: канал `picture` оставлен как есть (см. отчёт ребейза).
-        for (g1, g2, _) in dotted_pairs(code) {
-            if g1.eq_ignore_ascii_case("БиблиотекаКартинок") {
-                out.push(make_usage("CommonPicture", &g2, None, "picture", line));
-            }
-        }
-    }
-}
-
-/// Обращение к вложенному объекту метаданных (макет объекта): ссылка собирается
-/// целиком вызывающим, а не по шаблону `<тип>.<имя>`.
-fn make_nested_usage(object_ref: String, kind: &'static str, line: usize) -> CodeUsage {
-    CodeUsage {
-        object_ref_key: object_ref.to_lowercase(),
-        object_ref,
-        member_path: None,
-        usage_kind: kind,
-        line,
-    }
 }
 
 /// Извлечь обращения к объектам метаданных из ТЕКСТА ЗАПРОСА (не из тела
@@ -1283,7 +1128,7 @@ mod tests {
     use super::*;
 
     fn kinds(c: &str) -> Vec<(String, Option<String>, &'static str)> {
-        extract_code_usages(c, None)
+        extract_code_usages(c)
             .into_iter()
             .map(|u| (u.object_ref, u.member_path, u.usage_kind))
             .collect()
@@ -1414,96 +1259,11 @@ mod tests {
     fn multiline_string_literal() {
         // Многострочный литерал запроса: путь на 2-й физической строке.
         let src = "Запрос.Текст =\n\"ВЫБРАТЬ * ИЗ Документ.Заказ\nГДЕ Истина\";";
-        let r = extract_code_usages(src, None);
+        let r = extract_code_usages(src);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].object_ref, "Document.Заказ");
         assert_eq!(r[0].usage_kind, "query");
         assert_eq!(r[0].line, 2, "путь на 2-й физической строке литерала");
-    }
-
-    #[test]
-    fn template_usage_from_object_module() {
-        // `ПолучитьМакет` в модуле объекта — макет ЭТОГО объекта.
-        let r = extract_code_usages(
-            "Таблица = ПолучитьМакет(\"Классификатор\");",
-            Some("Catalog.ВидыДокументов"),
-        );
-        assert_eq!(r.len(), 1);
-        assert_eq!(
-            r[0].object_ref,
-            "Catalog.ВидыДокументов.Template.Классификатор"
-        );
-        assert_eq!(r[0].usage_kind, "template");
-    }
-
-    #[test]
-    fn template_usage_without_owner_is_skipped() {
-        // Владельца нет (общий модуль) — макет не приписываем никому.
-        let r = extract_code_usages("Таблица = ПолучитьМакет(\"Классификатор\");", None);
-        assert!(r.is_empty(), "без владельца обращение к макету не пишется");
-    }
-
-    #[test]
-    fn template_usage_from_qualified_call() {
-        // Приёмник вызова называет владельца: так макет берут из общего модуля.
-        let r = extract_code_usages(
-            "Таблица = Справочники.ВидыДокументов.ПолучитьМакет(\"Классификатор\");",
-            None,
-        );
-        assert!(r.iter().any(
-            |u| u.object_ref == "Catalog.ВидыДокументов.Template.Классификатор"
-                && u.usage_kind == "template"
-        ));
-    }
-
-    #[test]
-    fn common_template_and_picture_usages() {
-        let r = extract_code_usages("М = ПолучитьОбщийМакет(\"ПечатнаяФорма\");", None);
-        assert!(r
-            .iter()
-            .any(|u| u.object_ref == "CommonTemplate.ПечатнаяФорма"
-                && u.usage_kind == "common_template"));
-
-        let p = extract_code_usages("Картинка = БиблиотекаКартинок.Логотип;", None);
-        assert!(p
-            .iter()
-            .any(|u| u.object_ref == "CommonPicture.Логотип" && u.usage_kind == "picture"));
-    }
-
-    #[test]
-    fn template_usage_needs_a_literal_argument() {
-        // Аргумент-переменная: имя макета неизвестно, связи нет.
-        let r = extract_code_usages("Таблица = ПолучитьМакет(ИмяМакета);", Some("Catalog.X"));
-        assert!(r.is_empty(), "вызов с переменной не даёт ложной связи");
-
-        // Вызов в комментарии — не вызов.
-        let r2 = extract_code_usages(
-            "Сообщить(\"текст\"); // ПолучитьМакет(\"Старый\")",
-            Some("Catalog.X"),
-        );
-        assert!(r2.is_empty(), "закомментированный вызов не считается");
-    }
-
-    #[test]
-    fn owner_ref_from_module_path() {
-        assert_eq!(
-            owner_ref_from_path("base/Catalogs/X/Ext/ManagerModule.bsl").as_deref(),
-            Some("Catalog.X")
-        );
-        assert_eq!(
-            owner_ref_from_path("base/Catalogs/X/Forms/Ф/Ext/Form/Module.bsl").as_deref(),
-            Some("Catalog.X"),
-            "модуль формы принадлежит тому же владельцу"
-        );
-        assert_eq!(
-            owner_ref_from_path("base/Reports/Отчет/Ext/ObjectModule.bsl").as_deref(),
-            Some("Report.Отчет")
-        );
-        assert_eq!(
-            owner_ref_from_path("base/CommonModules/М/Ext/Module.bsl"),
-            None,
-            "у общего модуля макетов нет — владелец не выводится"
-        );
     }
 
     #[test]
@@ -1683,7 +1443,6 @@ mod tests {
         // `template_call` — дополнительные каналы.
         let r = extract_code_usages_for_index(
             "Док = Документы.Заказ.СоздатьДокумент(); Схема = ПолучитьМакет(\"Макет1\");",
-            None,
         );
         let kinds_got: Vec<&str> = r.iter().map(|u| u.usage_kind).collect();
         assert!(kinds_got.contains(&"manager"), "{r:?}");
@@ -1761,7 +1520,6 @@ mod tests {
         // наш строковый канал — из дополнительных.
         let r = extract_code_usages_for_index(
             "Схема = ПолучитьМакет(\"Макет1\"); М = ОбщийМодуль(\"Обмен\"); Д = Документы.Заказ;",
-            None,
         );
         let got: Vec<(&str, &str)> = r
             .iter()

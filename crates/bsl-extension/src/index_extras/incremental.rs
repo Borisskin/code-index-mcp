@@ -1139,10 +1139,7 @@ pub(crate) fn update_code_usages_for_file(
             let usages = if is_xml {
                 crate::code_usages::extract_xml_usages(&content)
             } else {
-                extract_code_usages_for_index(
-                    &content,
-                    crate::code_usages::owner_ref_from_path(&rel).as_deref(),
-                )
+                extract_code_usages_for_index(&content)
             };
             if !usages.is_empty() {
                 let mut stmt = conn.prepare(

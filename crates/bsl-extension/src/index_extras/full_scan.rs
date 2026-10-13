@@ -685,10 +685,7 @@ pub(crate) fn index_metadata_code_usages(
         .filter_map(|path| {
             let content = std::fs::read_to_string(path).ok()?; // не UTF-8 — пропуск
             let rel = rel_path(repo_root, path);
-            let usages = extract_code_usages_for_index(
-                &content,
-                crate::code_usages::owner_ref_from_path(&rel).as_deref(),
-            );
+            let usages = extract_code_usages_for_index(&content);
             if usages.is_empty() {
                 None
             } else {
