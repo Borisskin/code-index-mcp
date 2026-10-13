@@ -299,39 +299,48 @@ fn visit_body_for_calls(
 /// call_expression/access, либо родитель access с единственным именованным
 /// ребёнком (голова цепочки `Ф().Метод()`). caller — имя процедуры-контейнера.
 fn record_method_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
-    if let Some(ident) = find_child_by_kind(node, "identifier") {
-        let method = node_text(ident, ctx.source).to_string();
-        if method.is_empty() {
-            return;
-        }
-
-        let callee = match node.parent() {
-            Some(parent)
-                if matches!(parent.kind(), "call_expression" | "access")
-                    && parent.named_child_count() > 1 =>
-            {
-                let receiver = parent.named_child(0).expect("named_child_count() > 1");
-                let q = node_text(receiver, ctx.source);
-                // Квалификатор — только цепочка имён (`ОбщегоНазначения`,
-                // `Справочники.Номенклатура`). Получатель-выражение
-                // (`Ф(1).Метод()`, `Массив[0].Метод()`) в имя не идёт: там
-                // оказывался кусок исходника со скобками и переносами строк,
-                // который поиск по графу не находил никогда.
-                if is_plain_qualifier(q) {
-                    format!("{q}.{method}")
-                } else {
-                    method
-                }
-            }
-            _ => method,
-        };
-
+    if let Some(callee) = callee_of(node, ctx.source) {
         ctx.calls.push(ParsedCall {
             caller: current_func.unwrap_or("<module>").to_string(),
             callee,
             line: node.start_position().row + 1,
         });
     }
+}
+
+/// Имя вызываемого из узла `method_call` — ровно то, что попадает в граф
+/// вызовов: голое имя либо `Квалификатор.Метод`, если вызов идёт через цепочку
+/// имён. Вынесено отдельно, потому что тем же правилом пользуется структурный
+/// разбор (`parse_structure`): имена в контексте вызовов обязаны совпадать с
+/// именами в графе, иначе контекст не найдётся.
+fn callee_of(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let ident = find_child_by_kind(node, "identifier")?;
+    let method = node_text(ident, source).to_string();
+    if method.is_empty() {
+        return None;
+    }
+
+    let callee = match node.parent() {
+        Some(parent)
+            if matches!(parent.kind(), "call_expression" | "access")
+                && parent.named_child_count() > 1 =>
+        {
+            let receiver = parent.named_child(0).expect("named_child_count() > 1");
+            let q = node_text(receiver, source);
+            // Квалификатор — только цепочка имён (`ОбщегоНазначения`,
+            // `Справочники.Номенклатура`). Получатель-выражение
+            // (`Ф(1).Метод()`, `Массив[0].Метод()`) в имя не идёт: там
+            // оказывался кусок исходника со скобками и переносами строк,
+            // который поиск по графу не находил никогда.
+            if is_plain_qualifier(q) {
+                format!("{q}.{method}")
+            } else {
+                method
+            }
+        }
+        _ => method,
+    };
+    Some(callee)
 }
 
 /// Обработать var_definition — объявление переменной(ых) модуля.
@@ -427,10 +436,295 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     })
 }
 
+/// Вид структурного блока модуля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BslBlockKind {
+    /// Цикл: `Для … По … Цикл`, `Для Каждого … Из … Цикл`, `Пока … Цикл`.
+    Loop,
+    /// `Попытка … Исключение … КонецПопытки` целиком, вместе с обработчиком.
+    Try,
+    /// `Если … Тогда … КонецЕсли` вместе со всеми `ИначеЕсли` и `Иначе`.
+    If,
+}
+
+/// Блок кода со своими границами и глубиной вложенности.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BslBlock {
+    pub kind: BslBlockKind,
+    /// Строки считаются от 1, границы включительные с обеих сторон.
+    pub line_start: usize,
+    pub line_end: usize,
+    /// 0 — тело процедуры или модуль верхнего уровня.
+    pub depth: u8,
+}
+
+/// Вызов вместе с контекстом: где именно он стоит в коде.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BslCallSite {
+    pub caller: String,
+    pub callee: String,
+    pub line: usize,
+    pub in_loop: bool,
+    pub in_exception: bool,
+    /// Глубина вложенности блоков на строке вызова.
+    pub depth: u8,
+}
+
+/// Структурный разбор модуля: блоки и вызовы с контекстом.
+#[derive(Debug, Clone, Default)]
+pub struct BslStructure {
+    pub blocks: Vec<BslBlock>,
+    pub calls: Vec<BslCallSite>,
+}
+
+impl BslStructure {
+    /// Контекст строки: попадает ли она в цикл, в `Попытку` и как глубоко
+    /// вложена. Берётся самый внутренний блок, содержащий строку.
+    pub fn context_at(&self, line: usize) -> (bool, bool, u8) {
+        let mut in_loop = false;
+        let mut in_exception = false;
+        let mut deepest: Option<u8> = None;
+        for b in &self.blocks {
+            if b.line_start <= line && line <= b.line_end {
+                match b.kind {
+                    BslBlockKind::Loop => in_loop = true,
+                    BslBlockKind::Try => in_exception = true,
+                    BslBlockKind::If => {}
+                }
+                deepest = Some(match deepest {
+                    Some(d) => d.max(b.depth),
+                    None => b.depth,
+                });
+            }
+        }
+        (in_loop, in_exception, deepest.map_or(0, |d| d + 1))
+    }
+}
+
+/// Разобрать структуру модуля BSL: блоки и контекст вызовов.
+///
+/// Отдельный публичный вход для структурных инструментов (`query_call_sites`,
+/// `get_node_structure`, `get_line_context`): они разбирают модуль по
+/// требованию, и им нужен и скелет блоков, и привязка вызовов к блокам. Разбор
+/// здесь ровно один — второй проход по тому же дереву стоил бы столько же,
+/// сколько первый, а модуль полигона разбирается за 7,4 мс.
+///
+/// Ничего не пишет и не кэширует: кэш — забота вызывающего.
+pub fn parse_structure(source: &str) -> BslStructure {
+    // Те же защиты, что и у индексации: двоичный модуль поставщика и дедлайн.
+    if looks_binary(source) {
+        return BslStructure::default();
+    }
+    let mut ts_parser = tree_sitter::Parser::new();
+    if ts_parser
+        .set_language(&tree_sitter_bsl::LANGUAGE.into())
+        .is_err()
+    {
+        return BslStructure::default();
+    }
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+    let for_parser = bsl_parse::normalize_for_parser(source);
+    let Some(tree) = ts_parser.parse(for_parser.as_ref(), None) else {
+        return BslStructure::default();
+    };
+
+    /// Кадр обхода: узел и накопленный контекст.
+    struct Frame<'a> {
+        node: tree_sitter::Node<'a>,
+        depth: u8,
+        proc: Option<String>,
+        loops: u32,
+        tries: u32,
+    }
+
+    let source_bytes = source.as_bytes();
+    let mut out = BslStructure::default();
+    let root = tree.root_node();
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut cursor = root.walk();
+    let top: Vec<Frame> = root
+        .children(&mut cursor)
+        .map(|node| Frame {
+            node,
+            depth: 0,
+            proc: None,
+            loops: 0,
+            tries: 0,
+        })
+        .collect();
+    stack.extend(top.into_iter().rev());
+
+    while let Some(frame) = stack.pop() {
+        let (mut depth, mut loops, mut tries) = (frame.depth, frame.loops, frame.tries);
+        let mut proc = frame.proc.clone();
+        let node = frame.node;
+        let start = node.start_position().row + 1;
+        let end = node.end_position().row + 1;
+
+        match node.kind() {
+            "procedure_definition" | "function_definition" => {
+                proc = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, source_bytes).to_string());
+            }
+            "for_statement" | "for_each_statement" | "while_statement" => {
+                out.blocks.push(BslBlock {
+                    kind: BslBlockKind::Loop,
+                    line_start: start,
+                    line_end: end,
+                    depth,
+                });
+                depth = depth.saturating_add(1);
+                loops += 1;
+            }
+            "try_statement" => {
+                out.blocks.push(BslBlock {
+                    kind: BslBlockKind::Try,
+                    line_start: start,
+                    line_end: end,
+                    depth,
+                });
+                depth = depth.saturating_add(1);
+                tries += 1;
+            }
+            "if_statement" => {
+                out.blocks.push(BslBlock {
+                    kind: BslBlockKind::If,
+                    line_start: start,
+                    line_end: end,
+                    depth,
+                });
+                depth = depth.saturating_add(1);
+            }
+            "method_call" => {
+                if let Some(callee) = callee_of(node, source_bytes) {
+                    out.calls.push(BslCallSite {
+                        caller: proc.clone().unwrap_or_else(|| "<module>".to_string()),
+                        callee,
+                        line: start,
+                        in_loop: loops > 0,
+                        in_exception: tries > 0,
+                        depth,
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(Frame {
+                node: child,
+                depth,
+                proc: proc.clone(),
+                loops,
+                tries,
+            });
+        }
+    }
+
+    out.blocks.sort_by_key(|b| (b.line_start, b.line_end));
+    out.calls.sort_by_key(|c| c.line);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::LanguageParser;
+
+    /// Структурный разбор: блоки, контекст вызовов и совпадение имён с графом.
+    #[test]
+    fn structure_reports_blocks_and_call_context() {
+        let source = "Процедура Тест()\n    Подготовить();\n    Попытка\n        Для Каждого Строка Из Товары Цикл\n            Обработать(Строка);\n        КонецЦикла;\n    Исключение\n        ЗаписатьОшибку();\n    КонецПопытки;\n    ОбщегоНазначения.Сообщить(\"готово\");\nКонецПроцедуры";
+        let s = parse_structure(source);
+
+        let try_block = s
+            .blocks
+            .iter()
+            .find(|b| b.kind == BslBlockKind::Try)
+            .expect("Попытка должна быть блоком");
+        assert_eq!(
+            (try_block.line_start, try_block.line_end, try_block.depth),
+            (3, 9, 0)
+        );
+        let loop_block = s
+            .blocks
+            .iter()
+            .find(|b| b.kind == BslBlockKind::Loop)
+            .expect("цикл должен быть блоком");
+        assert_eq!(
+            (loop_block.line_start, loop_block.line_end, loop_block.depth),
+            (4, 6, 1)
+        );
+
+        let call = |name: &str| {
+            s.calls
+                .iter()
+                .find(|c| c.callee == name)
+                .unwrap_or_else(|| panic!("нет вызова {name}"))
+        };
+
+        let plain = call("Подготовить");
+        assert_eq!(
+            (plain.line, plain.in_loop, plain.in_exception, plain.depth),
+            (2, false, false, 0)
+        );
+
+        let in_both = call("Обработать");
+        assert_eq!(
+            (
+                in_both.line,
+                in_both.in_loop,
+                in_both.in_exception,
+                in_both.depth
+            ),
+            (5, true, true, 2)
+        );
+
+        let in_catch = call("ЗаписатьОшибку");
+        assert_eq!(
+            (
+                in_catch.line,
+                in_catch.in_loop,
+                in_catch.in_exception,
+                in_catch.depth
+            ),
+            (8, false, true, 1)
+        );
+
+        // Квалифицированный вызов остаётся таким же, как в графе вызовов.
+        let qualified = call("ОбщегоНазначения.Сообщить");
+        assert_eq!(qualified.depth, 0);
+        assert!(!qualified.in_loop && !qualified.in_exception);
+
+        // Вызыватель — процедура-контейнер, у всех вызовов одна.
+        assert!(s.calls.iter().all(|c| c.caller == "Тест"));
+    }
+
+    /// Контекст строки: самый внутренний блок и признаки цикла и `Попытки`.
+    #[test]
+    fn structure_context_at_line() {
+        // `Попытка` без `Исключение` — невалидный BSL: грамматика такой блок не
+        // собирает, и тест на нём проверял бы не то, что задумано.
+        let source = "Процедура Тест()\n    Для Каждого Строка Из Товары Цикл\n        Попытка\n            Обработать(Строка);\n        Исключение\n            ЗаписатьОшибку();\n        КонецПопытки;\n    КонецЦикла;\nКонецПроцедуры";
+        let s = parse_structure(source);
+        assert_eq!(s.context_at(1), (false, false, 0));
+        assert_eq!(s.context_at(2), (true, false, 1));
+        assert_eq!(s.context_at(4), (true, true, 2));
+        assert_eq!(s.context_at(9), (false, false, 0));
+    }
+
+    /// Двоичный модуль поставщика не разбирается — как и при индексации.
+    #[test]
+    fn structure_skips_binary_module() {
+        let s = parse_structure("\u{0}\u{1}\u{2}бинарный");
+        assert!(s.blocks.is_empty());
+        assert!(s.calls.is_empty());
+    }
 
     #[test]
     fn test_parse_bsl_procedure() {
