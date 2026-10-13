@@ -1,7 +1,7 @@
 //! Полный сбор слоя метаданных: перечень объектов, связи данных, права
 //! ролей, формы, подписки, обращения в коде, механические термы.
 
-use crate::code_usages::extract_code_usages;
+use crate::code_usages::extract_code_usages_for_index;
 use crate::xml::config_dump_info::{parse_config_dump_info_id_map, parse_config_dump_info_rows};
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::edt_mdo::MdoTemplate;
@@ -13,7 +13,7 @@ use crate::xml::metadata_refs::{
     parse_role_rights_file, parse_subsystem_content_file,
 };
 use crate::xml::object_attributes::{
-    parse_object_header_xml, parse_template_type, ObjectStructure,
+    parse_object_belonging, parse_object_header_xml, parse_template_type, ObjectStructure,
 };
 use anyhow::Result;
 use rusqlite::params;
@@ -120,8 +120,8 @@ pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connectio
         params![REPO_DEFAULT],
     )?;
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO metadata_objects (repo, full_name, meta_type, name) \
-         VALUES (?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO metadata_objects (repo, full_name, meta_type, name, sub_config) \
+         VALUES (?, ?, ?, ?, ?)",
     )?;
     let mut total = 0usize;
     let mut sources: Vec<(String, usize)> = Vec::with_capacity(config_paths.len());
@@ -133,13 +133,32 @@ pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connectio
                 continue;
             }
         };
+        // Владелец объекта: '' для базовой области, путь расширения — для
+        // собственного (Native) объекта. Объекты базовой области не читаем
+        // повторно (владелец заведомо ''), поэтому лишние чтения XML — только
+        // у расширений (десятки объектов, не тысячи).
+        let cfg_ext_name = cfg_path
+            .parent()
+            .map(|sub_root| compute_extension_name(&scan.repo_root, sub_root))
+            .unwrap_or_default();
         let count_before = total;
         for obj in &objects {
+            let sub_config = if cfg_ext_name.is_empty() {
+                String::new()
+            } else {
+                match plural_folder(&obj.meta_type) {
+                    Some(folder) => {
+                        object_sub_config(&scan.repo_root, &scan.sub_roots, folder, &obj.name)
+                    }
+                    None => String::new(),
+                }
+            };
             stmt.execute(params![
                 REPO_DEFAULT,
                 &obj.full_name,
                 &obj.meta_type,
                 &obj.name,
+                &sub_config,
             ])?;
             total += 1;
         }
@@ -172,11 +191,28 @@ pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connectio
                 None => continue,
             };
             // Верхнеуровневые уже вставлены из Configuration.xml — IGNORE вернёт 0.
+            // Владелец — как у прочих объектов: собственный (Native) узел
+            // расширения получает путь области, база/заимствованный — ''.
+            let sub_config = match scan.sub_root_of(path) {
+                Some(root) => {
+                    let ext = compute_extension_name(&scan.repo_root, root);
+                    if ext.is_empty() {
+                        String::new()
+                    } else {
+                        match std::fs::read_to_string(path) {
+                            Ok(c) if parse_object_belonging(&c).as_deref() == Some("Native") => ext,
+                            _ => String::new(),
+                        }
+                    }
+                }
+                None => String::new(),
+            };
             nested_subsystems += stmt.execute(params![
                 REPO_DEFAULT,
                 &format!("Subsystem.{}", stem),
                 "Subsystem",
                 stem,
+                &sub_config,
             ])?;
         }
     }
@@ -649,10 +685,7 @@ pub(crate) fn index_metadata_code_usages(
         .filter_map(|path| {
             let content = std::fs::read_to_string(path).ok()?; // не UTF-8 — пропуск
             let rel = rel_path(repo_root, path);
-            let usages = extract_code_usages(
-                &content,
-                crate::code_usages::owner_ref_from_path(&rel).as_deref(),
-            );
+            let usages = extract_code_usages_for_index(&content);
             if usages.is_empty() {
                 None
             } else {
@@ -689,6 +722,134 @@ pub(crate) fn index_metadata_code_usages(
     ));
     tracing::info!(
         "metadata_code_usages: {} обращений из {} .bsl",
+        total,
+        files
+    );
+    Ok(())
+}
+
+/// Собрать обращения к объектам МД из XML-выгрузки (формы, схемы, стили,
+/// объектные XML): формы `CommonPicture.X` и `style:X`. Возвращает пары
+/// (путь относительно корня репо, обращения файла). Разбор независимых файлов
+/// — параллельно; `ConfigDumpInfo.xml` (опись состава, перечень ИМЁН объектов)
+/// пропускается — иначе каждый объект-картинка «нашёлся» бы сам на себя.
+///
+/// Файлы НЕ предфильтруются по имени каталога (F6): сканируются ВСЕ `.xml`
+/// выгрузки, потому что ссылки `style:X`/`CommonPicture.X` лежат не только в
+/// формах, а предфильтр молча теряет часть ссылок и превращает используемые
+/// объекты в ложных «мёртвых».
+///
+/// РАЗМЕР ВЫБОРКИ ЗАМЕРА (prod3): ≈20 549 файлов `.xml`, из них ≈11 174 строки
+/// со ссылками `common_picture`/`style_item` — это база сравнения для чисел
+/// потерь ниже (потери считаны на ней же).
+///
+/// Полный список рассмотренных предфильтров с потерями (числа — строки со
+/// ссылками, которые предфильтр исключил бы; замер инвариантщика):
+///
+///   * `Ext + верхнеуровневые объектные XML` — 766 строк;
+///   * `Forms|Ext|Templates` — 957 строк в 136 файлах;
+///   * `Forms|Templates` — 1 553 строки;
+///   * только `Forms` — 3 936 строк.
+///
+/// Даже «самый полный» вариант (`Ext` + объектные XML верхнего уровня) терял
+/// 766 строк, поэтому цена сканирования всех `.xml` (несколько тысяч файлов,
+/// разбор построчный) принята меньшей, чем цена молчаливой потери ссылок.
+/// КРИТЕРИЙ ПЕРЕСМОТРА решения: предфильтр можно вводить только при
+/// одновременном выполнении двух условий — (1) потери на замеренной выгрузке
+/// падают ниже порога (например < 100 строк при ≈11 174 строках со ссылками) и
+/// (2) покрытие подтверждено СРАВНЕНИЕМ МНОЖЕСТВ (какие именно пары
+/// «файл → ссылка» теряются, а не только их счёт), — иначе остаётся полный
+/// обход всех `.xml`.
+/// Пересчёт потерь (воспроизведение замера): внешним проходом по файлам
+/// выгрузки вызвать [`crate::code_usages::extract_xml_usages`] на каждом `.xml`,
+/// попавшем и не попавшем под фильтр, и сравнить число полученных обращений
+/// `common_picture`/`style_item`.
+pub(crate) fn collect_xml_usages(
+    repo_root: &Path,
+) -> Vec<(String, Vec<crate::code_usages::CodeUsage>)> {
+    use rayon::prelude::*;
+    let filter = DirFilter::load(repo_root);
+    let xml_paths: Vec<std::path::PathBuf> = WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|e| filter.allows(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.file_name().to_str() != Some("ConfigDumpInfo.xml")
+                && e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("xml"))
+                    == Some(true)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    xml_paths
+        .par_iter()
+        .filter_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?; // не UTF-8 — пропуск
+            let usages = crate::code_usages::extract_xml_usages(&content);
+            if usages.is_empty() {
+                None
+            } else {
+                Some((rel_path(repo_root, path), usages))
+            }
+        })
+        .collect()
+}
+
+/// Наполнить `metadata_code_usages` обращениями из XML-выгрузки. Идемпотентно:
+/// сносит прежние XML-строки репо (`file_path LIKE '%.xml'`) и пишет заново.
+/// .bsl-строки НЕ трогает: их наполняет либо `index_metadata_code_usages`, либо
+/// parse-collector (полный путь bsl-indexer) — оба идут ДО этой фазы.
+pub(crate) fn index_metadata_xml_usages(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let parsed = collect_xml_usages(repo_root);
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    // lower() в SQLite кириллицу не берёт, но расширение `.xml` — ASCII,
+    // поэтому суффикс сворачивается корректно (путь целиком не портится).
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND lower(file_path) LIKE '%.xml'",
+        params![REPO_DEFAULT],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO metadata_code_usages \
+         (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut total = 0usize;
+    let mut files = 0usize;
+    for (rel, usages) in &parsed {
+        files += 1;
+        for u in usages {
+            stmt.execute(params![
+                REPO_DEFAULT,
+                &u.object_ref,
+                &u.object_ref_key,
+                &u.member_path,
+                u.usage_kind,
+                rel,
+                u.line as i64,
+            ])?;
+            total += 1;
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "обращение",
+        "обращения",
+        "обращений",
+    ));
+    tracing::info!(
+        "metadata_code_usages (XML): {} обращений из {} .xml",
         total,
         files
     );

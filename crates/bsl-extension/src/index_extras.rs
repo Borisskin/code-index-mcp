@@ -170,6 +170,15 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
             || index_metadata_code_usages(repo_root, conn),
         );
     }
+    // XML-часть обратного индекса (формы/стили/картинки: `CommonPicture.X`,
+    // `style:X`) — parse-collector её не покрывает (он видит только .bsl),
+    // поэтому она досчитывается отдельной идемпотентной фазой ВСЕГДА, ПОСЛЕ
+    // .bsl-части: эта фаза сносит только XML-строки и не трогает .bsl.
+    let _ = phase(
+        "использования в коде (XML)",
+        "metadata_code_usages (XML)",
+        || index_metadata_xml_usages(repo_root, conn),
+    );
     // Механические термы процедур (имя + объект + синоним + комментарий) —
     // после синонимов (использует metadata_objects.synonym, заполнен в слое).
     // Если parse-collector собрал сырьё в staging (полная переиндексация

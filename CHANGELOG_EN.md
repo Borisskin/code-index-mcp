@@ -5,6 +5,23 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**Objects with no references: which references were counted, which forms are not indexed, and why "no references" is not a verdict.**
+
+### Added
+
+- **BSL tool `find_unreferenced_objects` (the 18th 1C-layer tool).** It answers which metadata objects no indexed channel references: declarative links `data_links`, role rights `role_rights`, and code references `metadata_code_usages` (collection managers `Документы.X`, type references `ДокументСсылка.X`, metadata paths in query texts). Template references are collected from four sources: string metadata paths in query texts, the bare form `ПолучитьМакет("X")` (the owner is resolved via the module file and its path), `ПолучитьОбщийМакет("X")`, and the method form `Справочники.X.ПолучитьМакет("Y")` (the owner is known from the receiver). Common pictures (`БиблиотекаКартинок.X`/`CommonPicture.X`), style items (`ЦветаСтиля.X`/`ШрифтыСтиля.X`), and string access to a common module (`ОбщийМодуль("X")`) are indexed as well. The result is paged by budget (`results` together with `results_total`/`results_shown`/`results_offset`/`results_has_more` and a ready-to-copy next call) plus `by_meta_type`; the list holds candidates to verify, not proof of dead code.
+- **An honest answer matters more than completeness.** `channels_applied` reports counters for every channel that fired, `channels_not_applied` lists the forms that are deliberately not indexed (a template call with a non-literal argument, the EN form `GetTemplate`/`GetCommonTemplate`, a call with a line break before the literal, `ОбщийМодуль(Expression)` and the method form), while `template_call_sites_unresolved`, `template_call_sites_missing_target` and `common_module_literal_sites_missing_target` report how many call sites could not be bound to an owner or target. An empty channel therefore means "not collected", not "the object is unused". `formula_version = c2-v3` names the output formula right in the response; on a stale index (`stale = true`) the numbers are withheld (`results = null`).
+
+### Compatibility
+
+- **A one-off re-index is required.** `channels_applied` and the template/picture/style/common-module channel read `metadata_code_usages`; on a base of the previous composition the channel counters stay zero until `bsl-indexer index <path> --force` is run. Raising `INDEX_DATA_VERSION` is the release-side step: the tool reports the index mismatch through the standard `stale` field.
+
+### Changed
+
+- **The template and common-picture channel is unified on one model.** The usage kinds `template`, `common_template`, `picture` and the `owner_ref` parameter of `extract_code_usages` (the 1.10.0 channel, where the owner was resolved at indexing time) are gone: the canonical model is the one from this release — `template_call*`, `common_template_call`, `common_picture`, `style_item`, with the owner resolved by the tool, the XML phase, and counters for uncovered forms. For already-built bases this means: `bsl_sql` no longer shows the removed kinds, and `get_object_profile.usage_channels` counts template references for the owning object as `template_call*` (the method form `Справочники.X.ПолучитьМакет("Y")` is visible to the owner, the bare form `ПолучитьМакет("X")` is bound to the template itself and shows up in `find_unreferenced_objects`). After a re-index, rows with the removed kinds disappear from `metadata_code_usages`.
+
 ## [1.11.0] — 2026-10-13
 
 **Call context and code skeleton: tools that answer WHERE a call sits — in a loop, in an exception handler, at which depth — not just who calls whom.**

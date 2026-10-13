@@ -13,12 +13,13 @@
 // все эти типы из-за приватных полей и Mutex<Storage>.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
     tools::{
-        FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetDcsSchemaTool,
-        GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
+        FindDataPathTool, FindPathBslTool, FindUnreferencedObjectsTool, GetDataLinksTool,
+        GetDcsSchemaTool, GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
         GetRegisterWritersTool, SearchTermsTool,
     },
 };
@@ -1420,4 +1421,627 @@ async fn ordinary_procedure_has_no_form_bindings() {
     }
     let s = storage.get().await.unwrap();
     assert!(bsl_extension::form_bindings::form_bindings(&s, "ЗначениеРеквизита").is_empty());
+}
+
+// ── find_unreferenced_objects (Требование 2 ТЗ, C2) ────────────────────────
+
+/// Пометить индекс собранным текущим бинарником: свежая тестовая БД номера не
+/// содержит и штатно считается устаревшей (`stale`) — инструмент тогда чисел
+/// не отдаёт (Требование 0).
+async fn mark_index_current(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
+    s.set_data_version(Storage::INDEX_DATA_VERSION).unwrap();
+}
+
+#[tokio::test]
+async fn find_unreferenced_objects_stale_index_returns_no_numbers() {
+    // Номер версии данных не проставлен → база устаревшая (Требование 0).
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+             VALUES ('default','Catalog.Нигде','Catalog','Нигде')",
+            [],
+        )
+        .unwrap();
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    }
+
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+
+    assert_eq!(res["stale"].as_bool(), Some(true), "{res}");
+    assert!(
+        res["results"].is_null(),
+        "при stale числа не отдаются: {res}"
+    );
+    assert!(res["results_total"].is_null(), "{res}");
+    assert!(res["hint"]
+        .as_str()
+        .unwrap_or("")
+        .contains("прежней версией данных"));
+}
+
+#[tokio::test]
+async fn find_unreferenced_objects_reports_channels_and_paginates() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        for (fqn, mt, nm) in [
+            ("Catalog.Вакансии", "Catalog", "Вакансии"),
+            (
+                "Catalog.Вакансии.Template.ПФ_MXL_Вакансия",
+                "Template",
+                "ПФ_MXL_Вакансия",
+            ),
+            (
+                "Catalog.Новости.Template._СтандартныеЗначения_ЗдесьУказатьКодКанала",
+                "Template",
+                "_СтандартныеЗначения_ЗдесьУказатьКодКанала",
+            ),
+            ("Subsystem.Продажи", "Subsystem", "Продажи"),
+        ] {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES (?, ?, ?, ?)",
+                params![REPO, fqn, mt, nm],
+            )
+            .unwrap();
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+        // Строковый путь метаданных в коде — как его кладёт extract_code_usages.
+        conn.execute(
+            "INSERT INTO metadata_code_usages \
+             (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+             VALUES ('default','Catalog.Вакансии','catalog.вакансии','ПФ_MXL_Вакансия', \
+                     'query','Catalogs/Вакансии/Ext/ManagerModule.bsl',58)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "max_response_bytes": 400}),
+    )
+    .await;
+
+    assert_eq!(res["formula_version"].as_str(), Some("c2-v3"));
+    assert!(
+        res["channels_applied"]["template_paths"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert_eq!(res["template_call_sites_unresolved"].as_u64(), Some(0));
+    assert!(res["not_addressable"]["Subsystem"].as_u64().unwrap_or(0) >= 1);
+    // Кандидат — только неиспользуемый макет: сам справочник снят каналом
+    // code_usages (строка пути — обращение к нему), используемый — template_paths.
+    let total = res["results_total"].as_u64().unwrap_or(0);
+    assert!(total >= 1, "{res}");
+    let mut seen: Vec<String> = res["results"]
+        .as_array()
+        .expect("results — массив")
+        .iter()
+        .filter_map(|r| r["full_name"].as_str().map(String::from))
+        .collect();
+    assert!(
+        !seen.is_empty(),
+        "массив не обнуляется даже при малом бюджете"
+    );
+    assert!(
+        !seen.contains(&"Catalog.Вакансии.Template.ПФ_MXL_Вакансия".to_string()),
+        "используемый макет не должен попасть в список: {seen:?}"
+    );
+    assert!(res["hint"]
+        .as_str()
+        .unwrap_or("")
+        .contains("НЕ доказательство"));
+
+    // Догрузка страниц по маркерам: набор собирается целиком.
+    let mut offset =
+        res["results_offset"].as_u64().unwrap_or(0) + res["results_shown"].as_u64().unwrap_or(0);
+    let mut guard = 0;
+    while seen.len() < total as usize && guard < 10 {
+        guard += 1;
+        let page = run_tool(
+            &FindUnreferencedObjectsTool,
+            &storage,
+            serde_json::json!({"repo": REPO, "max_response_bytes": 400, "offset": offset}),
+        )
+        .await;
+        assert_eq!(page["results_total"].as_u64(), Some(total));
+        let items = page["results"].as_array().expect("results — массив");
+        assert!(!items.is_empty(), "страница не пуста, пока есть остаток");
+        seen.extend(
+            items
+                .iter()
+                .filter_map(|r| r["full_name"].as_str().map(String::from)),
+        );
+        offset += page["results_shown"].as_u64().unwrap_or(0);
+        if !page["results_has_more"].as_bool().unwrap_or(false) {
+            break;
+        }
+    }
+    assert!(
+        seen.contains(
+            &"Catalog.Новости.Template._СтандартныеЗначения_ЗдесьУказатьКодКанала".to_string()
+        ),
+        "неиспользуемый макет обязан остаться в наборе: {seen:?}"
+    );
+    assert!(!seen.contains(&"Catalog.Вакансии.Template.ПФ_MXL_Вакансия".to_string()));
+}
+
+/// A9: RU-форма `meta_type` нормализуется в каноническую на входе `execute`.
+#[tokio::test]
+async fn find_unreferenced_objects_meta_type_normalizes_russian() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        for (fqn, mt, nm) in [
+            ("Catalog.Нигде", "Catalog", "Нигде"),
+            ("Subsystem.Продажи", "Subsystem", "Продажи"),
+        ] {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES ('default', ?1, ?2, ?3)",
+                params![fqn, mt, nm],
+            )
+            .unwrap();
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    }
+
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "meta_type": "Справочник"}),
+    )
+    .await;
+    assert_eq!(res["results_total"].as_u64(), Some(1), "{res}");
+    assert_eq!(
+        res["results"][0]["full_name"].as_str(),
+        Some("Catalog.Нигде")
+    );
+    assert!(
+        res["not_addressable"].as_object().unwrap().is_empty(),
+        "Subsystem вне фильтра Catalog не считается: {res}"
+    );
+
+    // Неизвестный тип нормализацией не портится — просто пустой результат.
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "meta_type": "НетТакогоТипа"}),
+    )
+    .await;
+    assert_eq!(res["results_total"].as_u64(), Some(0), "{res}");
+}
+
+/// A9: `offset` за концом набора — пустая страница, `has_more=false`.
+#[tokio::test]
+async fn find_unreferenced_objects_offset_beyond_end_is_empty_page() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES ('default', ?1, 'Catalog', ?2)",
+                params![format!("Catalog.О{i}"), format!("О{i}")],
+            )
+            .unwrap();
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    }
+
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "offset": 9999}),
+    )
+    .await;
+    assert_eq!(res["results_total"].as_u64(), Some(3), "{res}");
+    assert_eq!(res["results_shown"].as_u64(), Some(0), "{res}");
+    assert_eq!(res["results_has_more"].as_bool(), Some(false), "{res}");
+    assert!(res["results"].as_array().unwrap().is_empty(), "{res}");
+}
+
+/// A2: `channels_not_applied` присутствует и перечисляет непокрытые формы.
+#[tokio::test]
+async fn find_unreferenced_objects_reports_channels_not_applied() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    let not_applied = res["channels_not_applied"]
+        .as_array()
+        .expect("channels_not_applied — массив");
+    let forms: Vec<&str> = not_applied.iter().filter_map(|v| v.as_str()).collect();
+    for form in [
+        "template_call_via_receiver",
+        "template_call_non_literal",
+        "template_call_english",
+        "template_call_multiline",
+    ] {
+        assert!(forms.contains(&form), "форма {form} не названа: {forms:?}");
+    }
+    assert!(res["channels_applied"]["template_calls_via_manager"].is_u64());
+}
+
+/// A1 (сквозной): исходник `Справочники.X.ПолучитьМакет("Y")` извлекается,
+/// попадает в индекс с владельцем в `object_ref` и снимает `Catalog.X.Template.Y`.
+#[tokio::test]
+async fn find_unreferenced_objects_end_to_end_manager_template_call() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    let src =
+        "Процедура П()\n\tСхема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");\nКонецПроцедуры";
+    // Дополнительные каналы разбора (`extract_extra_usages`) — ровно то, что
+    // кладёт в индекс индексатор для метод-формы макета.
+    let usages = bsl_extension::code_usages::extract_extra_usages(src);
+    assert!(
+        usages
+            .iter()
+            .any(|u| u.usage_kind == "template_call_via_manager"
+                && u.object_ref == "Catalog.Вакансии"),
+        "{usages:?}"
+    );
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        for (fqn, mt, nm) in [
+            ("Catalog.Вакансии", "Catalog", "Вакансии"),
+            ("Catalog.Вакансии.Template.ПФ", "Template", "ПФ"),
+            ("Catalog.Вакансии.Template.Мёртвый", "Template", "Мёртвый"),
+        ] {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES ('default', ?1, ?2, ?3)",
+                params![fqn, mt, nm],
+            )
+            .unwrap();
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+        for u in &usages {
+            conn.execute(
+                "INSERT INTO metadata_code_usages \
+                 (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+                 VALUES ('default', ?1, ?2, ?3, ?4, 'Catalogs/Вакансии/Ext/ManagerModule.bsl', ?5)",
+                params![
+                    u.object_ref,
+                    u.object_ref_key,
+                    u.member_path,
+                    u.usage_kind,
+                    u.line as i64
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "meta_type": "Template"}),
+    )
+    .await;
+    let names: Vec<&str> = res["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["full_name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Catalog.Вакансии.Template.ПФ"),
+        "метод-форма обязана снять ПФ: {names:?}"
+    );
+    assert!(
+        names.contains(&"Catalog.Вакансии.Template.Мёртвый"),
+        "неиспользуемый макет обязан остаться: {names:?}"
+    );
+    assert_eq!(
+        res["channels_applied"]["template_calls_via_manager"].as_u64(),
+        Some(1)
+    );
+}
+
+/// B1 (сквозной): ИТОГОВЫЙ ответ инструмента (обёртка `{result,_meta}` целиком)
+/// при любом бюджете не превышает запрошенный. Набор — 500 макетов-кандидатов,
+/// страница заполняется целиком (несколько ходов на бюджет 8 000).
+#[tokio::test]
+async fn find_unreferenced_objects_response_fits_requested_budget() {
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    const N: usize = 500;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        for i in 0..N {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES ('default', ?1, 'Template', ?2)",
+                params![
+                    format!("Catalog.Объект{i:04}.Template.Макет{i:04}"),
+                    format!("Макет{i:04}")
+                ],
+            )
+            .unwrap();
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    }
+
+    let call = |args: Value| async {
+        let ctx = ToolContext {
+            repo: REPO,
+            root_path: None,
+            language: Some("bsl"),
+            storage: &storage,
+        };
+        FindUnreferencedObjectsTool.execute(args, ctx).await
+    };
+
+    for budget in [8_000usize, 48_000] {
+        let mut offset = 0usize;
+        let mut seen = 0usize;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(pages <= N + 2, "зациклились на пагинации");
+            let raw = call(serde_json::json!({
+                "repo": REPO,
+                "max_response_bytes": budget,
+                "offset": offset,
+            }))
+            .await;
+            let len = serde_json::to_string(&raw).unwrap().len();
+            let res = &raw["result"];
+            let shown = res["results"].as_array().unwrap().len();
+            println!(
+                "B1e2e budget={budget} offset={offset} -> len={len} shown={shown} has_more={}",
+                res["results_has_more"]
+            );
+            assert!(
+                len <= budget,
+                "бюджет {budget}, offset {offset}: итоговый размер {len} превысил бюджет"
+            );
+            assert!(shown > 0, "страница не обнуляется, пока есть остаток");
+            seen += shown;
+            offset += shown;
+            if !res["results_has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(seen, N, "бюджет {budget}: страницы покрывают весь набор");
+    }
+
+    // Кламп: запрос сверх серверного потолка зажимается, ответ ≤ потолка.
+    let hard = code_index_core::mcp::cap::response_cap_hard();
+    let raw = call(serde_json::json!({"repo": REPO, "max_response_bytes": 999_999})).await;
+    let len = serde_json::to_string(&raw).unwrap().len();
+    println!("B1e2e clamp(request=999999) -> len={len} hard={hard}");
+    assert!(
+        len <= hard,
+        "при клампе итоговый размер {len} превысил потолок {hard}"
+    );
+    assert_eq!(raw["result"]["results_total"].as_u64(), Some(N as u64));
+}
+
+/// D2 (E-11): тот же утяжелённый обход, на котором раньше доказывалась работа
+/// таймера, теперь обязан ЗАВЕРШИТЬСЯ и отдать числа — без срабатывания
+/// `execute`-таймера. У `metadata_code_usages` по-прежнему снят `idx_mcu_ref`
+/// (фикстура та же), но обход больше НЕ зависит от этого индекса: виды
+/// обращений приходят ОДНИМ проходом (`load_usage_index`), а не коррелированным
+/// `GROUP_CONCAT` на каждый объект. На прежнем коде этот же тест падал: обход
+/// (200 000 строк × 20 000 объектов) не укладывался в `QUERY_TIMEOUT_SECS = 8`,
+/// таймер прерывал запрос, и инструмент возвращал `{error: "database error: …"}`
+/// вместо чисел.
+#[tokio::test]
+async fn find_unreferenced_objects_heavy_scan_completes_without_interrupt() {
+    const OBJECTS: usize = 20_000;
+    const USAGES: usize = 200_000;
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute("DROP INDEX IF EXISTS idx_mcu_ref", [])
+            .unwrap();
+        // Одной транзакцией: 220 000 отдельных автокоммитов — это минуты.
+        conn.execute("BEGIN", []).unwrap();
+        {
+            let mut obj = conn
+                .prepare(
+                    "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                     VALUES ('default', ?1, 'Catalog', ?2)",
+                )
+                .unwrap();
+            for i in 0..OBJECTS {
+                let name = format!("O{i:05}");
+                obj.execute(params![format!("Catalog.{name}"), name])
+                    .unwrap();
+            }
+        }
+        {
+            let mut usage = conn
+                .prepare(
+                    "INSERT INTO metadata_code_usages \
+                     (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+                     VALUES ('default', ?1, ?2, NULL, 'manager', \
+                             'Catalogs/X/Ext/ManagerModule.bsl', 1)",
+                )
+                .unwrap();
+            for i in 0..USAGES {
+                let name = format!("O{:05}", i % OBJECTS);
+                usage
+                    .execute(params![
+                        format!("Catalog.{name}"),
+                        format!("catalog.{}", name.to_lowercase())
+                    ])
+                    .unwrap();
+            }
+        }
+        bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+        conn.execute("COMMIT", []).unwrap();
+    }
+
+    let t = Instant::now();
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    let elapsed = t.elapsed();
+    println!("E-11 heavy scan without idx_mcu_ref: elapsed={elapsed:?} res={res}");
+    assert!(
+        res["error"].is_null(),
+        "обход обязан уложиться в таймаут и отдать числа, а не ошибку: {res}"
+    );
+    assert_eq!(
+        res["results_total"].as_u64(),
+        Some(0),
+        "у каждого объекта есть обращение в коде — «мёртвых» нет: {res}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "обход обязан закончиться ДО таймера (иначе числа могли прийти из \
+         незавершённого прохода): {elapsed:?}"
+    );
+}
+
+/// F2 (E-2): страж на уровне `execute` — утяжелённый обход обязан быть прерван
+/// таймером `execute` и вернуть ОШИБКУ, а не висеть до конца (и не отдать
+/// числа). Юнит-тест `blocking_query_is_interrupted_by_timer` проверяет только
+/// сам механизм `spawn_blocking` + `sqlite3_interrupt`; проводка таймера в
+/// `execute` проверяется здесь.
+///
+/// Вес даёт КВАДРАТИЧНОЕ место внутри обхода, которое сохраняется на любом
+/// плане: канал общих модулей проверяет «внешность» ребра перебором ВСЕХ путей
+/// модуля (`load_common_module_hits`, E-4). У одного общего модуля здесь 20 000
+/// путей с длинным общим префиксом, и каждое из 30 000 self-рёбер дочитывает
+/// список путей до последнего элемента (≈20 000 сравнений строк по ~44 байта) —
+/// десятки секунд, т.е. к моменту срабатывания таймера обход гарантированно
+/// внутри одного запроса, а не в промежутке между ними. Прерывание доходит до
+/// `execute` ошибкой `OperationInterrupted` → ответ `{error: "database error: …"}`.
+///
+/// ВАЛИДНОСТЬ ЭТОГО ТЕСТА ДЕРЖИТСЯ НА ДВУХ ОПОРАХ (обе обязательны):
+///
+///   (а) РАНТАЙМ ТЕСТА — current-thread: у `#[tokio::test]` это дефолт, флаг
+///       `flavor = "multi_thread"` здесь ставить НЕЛЬЗЯ. На multi-thread таймер
+///       дёрнулся бы на другом воркере, даже если синхронный обход выполняется
+///       прямо на async-воркере (без `spawn_blocking`), и страж перестал бы
+///       ловить откат `spawn_blocking` — тест оставался бы зелёным на сломанном
+///       коде. На current-thread заблокированный единственный поток не даёт
+///       таймеру сработать, поэтому зелёный тест = таймер действительно
+///       выполнился и действительно прервал обход.
+///   (б) ИСКУССТВЕННО УТЯЖЕЛЁННЫЙ ОБХОД — 20 000 путей одного общего модуля и
+///       30 000 self-рёбер: утяжеление — свойство фикстуры теста, а не
+///       продакшн-плана (до ребейза вес давало снятие `idx_mcu_ref`; после
+///       сведения запросов обхода этот приём перестал утяжелять проход — см.
+///       `…_heavy_scan_completes_without_interrupt`).
+///
+/// ОРИГИНАЛ ПЕРЕСМОТРА: если `load_common_module_hits` перестанет перебирать
+/// пути владельца (например, заменит перебор на множество) или изменится
+/// `QUERY_TIMEOUT_SECS`, фикстуру надо пересчитать так, чтобы обход был
+/// ЗАВЕДОМО дольше таймаута; одновременно проверить, что нижняя граница
+/// `elapsed >= 7 с` по-прежнему означает «сработал таймер», а не «завис».
+#[tokio::test]
+async fn find_unreferenced_objects_execute_interrupts_heavy_scan() {
+    const PATHS: usize = 20_000;
+    const EDGES: usize = 30_000;
+    let (_tmp, storage) = fresh_storage();
+    mark_index_current(&storage).await;
+    let path = |i: usize| format!("blocks/deep/extension/segment/of/module/paths/{i:05}");
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute("BEGIN", []).unwrap();
+        {
+            let mut module = conn
+                .prepare(
+                    "INSERT INTO metadata_modules \
+                     (repo, full_name, object_name, module_type, object_id, property_id, \
+                      code_path, extension_name) \
+                     VALUES ('default', ?1, 'CommonModules.ТяжёлыйМодуль', 'Module', ?4, '', ?2, ?3)",
+                )
+                .unwrap();
+            for i in 0..PATHS {
+                // extension_name задаёт порядок обхода путей владельца
+                // (`ORDER BY object_name, extension_name`): путь с наибольшим
+                // номером дочитывается перебором ДО КОНЦА.
+                module
+                    .execute(params![
+                        format!("CommonModules.ТяжёлыйМодуль.Module{i:05}"),
+                        path(i),
+                        format!("{i:05}"),
+                        format!("obj{i:05}")
+                    ])
+                    .unwrap();
+            }
+        }
+        {
+            let mut edge = conn
+                .prepare(
+                    "INSERT INTO proc_call_graph \
+                     (repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type) \
+                     VALUES ('default', ?1, 'Метод', ?2, 'direct')",
+                )
+                .unwrap();
+            let path_key = path(PATHS - 1);
+            for i in 0..EDGES {
+                // caller == callee: ребро внутри модуля (self) — владелец
+                // использованием не считается, и перебор путей повторяется на
+                // каждом ребре. Имена методов разные: у `proc_call_graph` UNIQUE
+                // по (repo, caller_proc_key, callee_proc_name, call_type).
+                let key = format!("{path_key}::Метод{i}");
+                edge.execute(params![key, key]).unwrap();
+            }
+        }
+        conn.execute("COMMIT", []).unwrap();
+    }
+
+    let t = Instant::now();
+    let res = run_tool(
+        &FindUnreferencedObjectsTool,
+        &storage,
+        serde_json::json!({"repo": REPO}),
+    )
+    .await;
+    let elapsed = t.elapsed();
+    println!("F2 execute+interrupt: elapsed={elapsed:?} res={res}");
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("database error"),
+        "утяжелённый обход обязан прерваться ошибкой базы, а не отдать числа: {res}"
+    );
+    assert!(
+        res["results"].is_null(),
+        "при прерывании чисел быть не должно: {res}"
+    );
+    // Нижняя граница — доказательство, что сработал таймер (≈8 с), а не «упало
+    // сразу»; верхняя — что таймер именно прервал обход, а не завис.
+    assert!(
+        elapsed >= Duration::from_secs(7) && elapsed < Duration::from_secs(30),
+        "таймер execute обязан прервать обход за ≈8 с: {elapsed:?}"
+    );
 }

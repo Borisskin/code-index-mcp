@@ -6347,3 +6347,238 @@ fn edt_не_пишет_отметку_возобновления() {
     run_index_extras(&repo, &mut storage).unwrap();
     assert_eq!(marker(&storage), 0, "повторный проход EDT — тоже целиком");
 }
+
+/// D2: полный проход проставляет `sub_config` объектам расширения так же, как
+/// инкрементальный: собственный (Native) объект — путь области, заимствованный
+/// (Adopted) — `''` (база).
+#[test]
+fn full_scan_fills_sub_config_for_extension_objects() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("base").join("Configuration.xml"),
+        r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Базовый</Catalog><Catalog>Заимствованный</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("base").join("Catalogs").join("Базовый.xml"),
+        r#"<MetaDataObject><Catalog uuid="r1"><Properties><Name>Базовый</Name></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("base")
+            .join("Catalogs")
+            .join("Заимствованный.xml"),
+        r#"<MetaDataObject><Catalog uuid="r2"><Properties><Name>Заимствованный</Name></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("base").join("ConfigDumpInfo.xml"),
+        "<ConfigDumpInfo/>",
+    );
+    write(
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
+        r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Свой</Catalog><Catalog>Заимствованный</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Свой.xml"),
+        r#"<MetaDataObject><Catalog uuid="r3"><Properties><Name>Свой</Name><ObjectBelonging>Native</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Заимствованный.xml"),
+        r#"<MetaDataObject><Catalog uuid="r2"><Properties><Name>Заимствованный</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
+        "<ConfigDumpInfo/>",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+    let sub = |full: &str| -> String {
+        conn.query_row(
+            "SELECT sub_config FROM metadata_objects WHERE full_name = ?",
+            params![full],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(sub("Catalog.Базовый"), "", "объект базы — владелец ''");
+    assert_eq!(
+        sub("Catalog.Заимствованный"),
+        "",
+        "заимствованный (Adopted) объект — владелец база"
+    );
+    assert_eq!(
+        sub("Catalog.Свой"),
+        "extensions/EF_A",
+        "собственный (Native) объект расширения — владелец-область"
+    );
+}
+
+/// Снимок XML-обращений (`metadata_code_usages` строки .xml) для сравнения
+/// полного пересбора и инкремента.
+fn snapshot_xml_usages(
+    conn: &rusqlite::Connection,
+) -> Vec<(String, String, Option<String>, String)> {
+    let mut s = conn
+        .prepare(
+            "SELECT object_ref, usage_kind, member_path, file_path FROM metadata_code_usages \
+             WHERE repo = ? AND lower(file_path) LIKE '%.xml' ORDER BY object_ref, usage_kind, file_path",
+        )
+        .unwrap();
+    let rows = s
+        .query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    rows.map(|x| x.unwrap()).collect()
+}
+
+/// D1: правка XML формы инкрементально обновляет XML-обращения
+/// (`CommonPicture.X`, `style:X`) ровно как полный пересбор.
+#[test]
+fn incremental_xml_form_change_matches_full_for_code_usages() {
+    let cfg = r#"<MetaDataObject><Configuration><ChildObjects><Catalog>К</Catalog></ChildObjects></Configuration></MetaDataObject>"#;
+    let form_v1 = r#"<Form><TextColor>style:ПервыйЦвет</TextColor></Form>"#;
+    let form_v2 = r#"<Form><Picture><xr:Ref>CommonPicture.Второй</xr:Ref></Picture><TextColor>style:НовыйЦвет</TextColor></Form>"#;
+    let form_rel = "Catalogs/К/Forms/Ф/Ext/Form.xml";
+
+    // truth: репо сразу в версии v2, полный пересбор.
+    let tmp_t = TempDir::new().unwrap();
+    let repo_t = tmp_t.path().join("repo");
+    write(&repo_t.join("Configuration.xml"), cfg);
+    write(&repo_t.join(form_rel), form_v2);
+    let mut st_t = fresh_storage(&tmp_t);
+    run_index_extras(&repo_t, &mut st_t).unwrap();
+
+    // incr: v1 → полный пересбор → правка формы на v2 → инкремент одного файла.
+    let tmp_i = TempDir::new().unwrap();
+    let repo_i = tmp_i.path().join("repo");
+    write(&repo_i.join("Configuration.xml"), cfg);
+    let form_path = repo_i.join(form_rel);
+    write(&form_path, form_v1);
+    let mut st_i = fresh_storage(&tmp_i);
+    run_index_extras(&repo_i, &mut st_i).unwrap();
+    write(&form_path, form_v2);
+    run_incremental_extras(&repo_i, &mut st_i, std::slice::from_ref(&form_path), &[]).unwrap();
+
+    assert_eq!(
+        snapshot_xml_usages(st_i.conn()),
+        snapshot_xml_usages(st_t.conn()),
+        "XML-обращения после инкремента != полному пересбору"
+    );
+    assert!(
+        snapshot_xml_usages(st_i.conn())
+            .iter()
+            .any(|(r, k, _, _)| r == "CommonPicture.Второй" && k == "common_picture"),
+        "форма v2 обязана дать common_picture"
+    );
+}
+
+/// E12(a): `ConfigDumpInfo.xml` НЕ является источником XML-ссылок, даже если
+/// внутри есть `CommonPicture.X` (опись — перечень ИМЁН объектов). Проверка на
+/// НЕпустом файле (пустой файл ничего бы не доказал).
+#[test]
+fn config_dump_info_is_not_an_xml_usage_source() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("ConfigDumpInfo.xml"),
+        "<ConfigDumpInfo><ConfigVersions><Metadata><Picture>CommonPicture.Секрет</Picture>\
+         </Metadata></ConfigVersions></ConfigDumpInfo>",
+    );
+    let form_rel = "Catalogs/А/Forms/Ф/Ext/Form.xml";
+    write(
+        &repo.join(form_rel),
+        "<Form><Picture><xr:Ref>CommonPicture.Настоящий</xr:Ref></Picture></Form>",
+    );
+    let got = collect_xml_usages(&repo);
+    let refs: Vec<(String, String)> = got
+        .iter()
+        .flat_map(|(p, us)| us.iter().map(move |u| (p.clone(), u.object_ref.clone())))
+        .collect();
+    assert!(
+        refs.iter()
+            .any(|(p, r)| p == form_rel && r == "CommonPicture.Настоящий"),
+        "обычная форма обязана дать ссылку: {refs:?}"
+    );
+    assert!(
+        !refs.iter().any(|(_, r)| r == "CommonPicture.Секрет"),
+        "ConfigDumpInfo.xml не должен быть источником ссылок: {refs:?}"
+    );
+}
+
+/// E12(b): повторный полный проход XML-фазы идемпотентен (строки не двоятся и
+/// не меняются).
+#[test]
+fn xml_phase_is_idempotent_on_repeated_full_pass() {
+    let cfg = r#"<MetaDataObject><Configuration><ChildObjects><Catalog>К</Catalog></ChildObjects></Configuration></MetaDataObject>"#;
+    let form_rel = "Catalogs/К/Forms/Ф/Ext/Form.xml";
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(&repo.join("Configuration.xml"), cfg);
+    write(
+        &repo.join(form_rel),
+        r#"<Form><Picture><xr:Ref>CommonPicture.П</xr:Ref></Picture><TextColor>style:Ц</TextColor></Form>"#,
+    );
+    let mut st = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut st).unwrap();
+    let once = snapshot_xml_usages(st.conn());
+    assert!(once
+        .iter()
+        .any(|(r, k, _, _)| r == "CommonPicture.П" && k == "common_picture"));
+    assert!(once
+        .iter()
+        .any(|(r, k, _, _)| r == "StyleItem.Ц" && k == "style_item"));
+    run_index_extras(&repo, &mut st).unwrap();
+    let twice = snapshot_xml_usages(st.conn());
+    assert_eq!(
+        once, twice,
+        "повторный полный проход не должен менять XML-обращения"
+    );
+}
+
+/// E12(c): удаление XML-файла сносит его usage-строки.
+#[test]
+fn xml_usage_rows_removed_when_file_deleted() {
+    let cfg = r#"<MetaDataObject><Configuration><ChildObjects><Catalog>К</Catalog></ChildObjects></Configuration></MetaDataObject>"#;
+    let form_rel = "Catalogs/К/Forms/Ф/Ext/Form.xml";
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(&repo.join("Configuration.xml"), cfg);
+    let form_path = repo.join(form_rel);
+    write(
+        &form_path,
+        r#"<Form><Picture><xr:Ref>CommonPicture.П</xr:Ref></Picture></Form>"#,
+    );
+    let mut st = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut st).unwrap();
+    assert!(
+        snapshot_xml_usages(st.conn())
+            .iter()
+            .any(|(_, _, _, p)| p == form_rel),
+        "до удаления строка есть"
+    );
+    std::fs::remove_file(&form_path).unwrap();
+    run_incremental_extras(&repo, &mut st, &[], std::slice::from_ref(&form_path)).unwrap();
+    assert!(
+        !snapshot_xml_usages(st.conn())
+            .iter()
+            .any(|(_, _, _, p)| p == form_rel),
+        "строки удалённого XML должны быть снесены"
+    );
+}

@@ -1,7 +1,7 @@
 //! Инкрементальное обновление по событиям наблюдателя: пофайловые ветки
 //! и сверка состава области по описи выгрузки.
 
-use crate::code_usages::extract_code_usages;
+use crate::code_usages::extract_code_usages_for_index;
 use crate::xml::config_dump_info::parse_config_dump_info_rows;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
@@ -499,6 +499,11 @@ pub fn run_incremental_extras(
     // Файлы содержимого макетов (`<Объект>/Templates/<Имя>/Ext/Template.<ext>`):
     // для схемы компоновки по ним пересобираются `dcs_*`.
     let mut dcs_contents: Vec<&std::path::PathBuf> = Vec::new();
+    // XML-выгрузка, годная как источник ссылок в коде (`CommonPicture.X`,
+    // `style:X`): формы, схемы, стили, объектные XML. Обрабатывается тем же
+    // пофайловым разбором, что и .bsl (`update_code_usages_for_file`), чтобы
+    // правка формы обновляла и `metadata_code_usages`.
+    let mut usage_xml_paths: Vec<&std::path::PathBuf> = Vec::new();
     // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
     // Они лежат вне OBJECT_FOLDERS и не привязаны к одному объекту → при
     // попадании дешевле полностью пересобрать соответствующую таблицу.
@@ -558,6 +563,18 @@ pub fn run_incremental_extras(
             sub_xmls.push(p);
         } else if object_full_name_from_path(p).is_some() {
             object_xmls.push(p);
+        }
+    }
+
+    // XML-выгрузка как источник ссылок в коде (`CommonPicture.X`, `style:X`)
+    // собирается НЕЗАВИСИМО от категории выше: один и тот же файл может быть и
+    // `Form.xml` (для слоя форм), и носителем ссылок. `ConfigDumpInfo.xml`
+    // (опись состава) исключён — там перечислены имена, а не ссылки.
+    for p in changed.iter().chain(deleted.iter()) {
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("xml") && fname != "ConfigDumpInfo.xml" {
+            usage_xml_paths.push(p);
         }
     }
 
@@ -760,6 +777,26 @@ pub fn run_incremental_extras(
             "граф вызовов, пофайловая часть: {} мс на {} файлов",
             per_file_graph.as_millis(),
             bsl_paths.len()
+        );
+    }
+    // XML-выгрузка: ссылки в коде, живущие в формах/стилях/картинках
+    // (`CommonPicture.X`, `style:X`). Тот же пофайловый разбор, что у .bsl.
+    if !usage_xml_paths.is_empty() {
+        let t = std::time::Instant::now();
+        for p in &usage_xml_paths {
+            if let Err(e) = update_code_usages_for_file(repo_root, conn, p) {
+                tracing::warn!("update_code_usages_for_file (XML) {}: {}", p.display(), e);
+            }
+        }
+        code_index_core::logging::stage_add("использования в коде (XML)", t.elapsed());
+        code_index_core::logging::stage_set_detail(
+            "использования в коде (XML)",
+            code_index_core::logging::plural(
+                usage_xml_paths.len() as u64,
+                "файл",
+                "файла",
+                "файлов",
+            ),
         );
     }
     // Пофайловый обход закончен — дальше общий на всю пачку резолв адресов.
@@ -1077,14 +1114,20 @@ pub(crate) fn reconcile_area(
     Ok(stats)
 }
 
-/// Per-file обновление `metadata_code_usages` для одного `.bsl`: снести прежние
-/// строки файла и переразобрать (или просто снести, если файл удалён).
+/// Per-file обновление `metadata_code_usages` для одного `.bsl`/`.xml`: снести
+/// прежние строки файла и переразобрать (или просто снести, если файл удалён).
+/// Разборщик выбирается по расширению: тела модулей — `extract_code_usages`,
+/// XML-выгрузка — `extract_xml_usages` (формы/стили/картинки).
 pub(crate) fn update_code_usages_for_file(
     repo_root: &Path,
     conn: &rusqlite::Connection,
     bsl_path: &Path,
 ) -> Result<()> {
     let rel = rel_path(repo_root, bsl_path);
+    let is_xml = bsl_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xml"));
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
     conn.execute(
@@ -1093,10 +1136,11 @@ pub(crate) fn update_code_usages_for_file(
     )?;
     if bsl_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(bsl_path) {
-            let usages = extract_code_usages(
-                &content,
-                crate::code_usages::owner_ref_from_path(&rel).as_deref(),
-            );
+            let usages = if is_xml {
+                crate::code_usages::extract_xml_usages(&content)
+            } else {
+                extract_code_usages_for_index(&content)
+            };
             if !usages.is_empty() {
                 let mut stmt = conn.prepare(
                     "INSERT INTO metadata_code_usages \

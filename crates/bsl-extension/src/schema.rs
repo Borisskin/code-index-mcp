@@ -539,9 +539,18 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //   * `object_ref`     — канонический объект (`Document.РеализацияТоваровУслуг`).
     //   * `object_ref_key` — `lower(object_ref)` для индексного поиска без UDF
     //     (точное сравнение по кириллице).
-    //   * `member_path`    — имя ТЧ для `query` (3-й сегмент пути), иначе NULL.
+    //   * `member_path`    — имя ТЧ для `query` (3-й сегмент пути), имя макета
+    //     для `template_call`/`common_template_call`, иначе NULL.
     //   * `usage_kind`     — `manager` (Документы.X) | `ref_type` ("ДокументСсылка.X")
-    //     | `query` (путь метаданных в тексте запроса).
+    //     | `query` (путь метаданных в тексте запроса) | `template_call`
+    //     (`ПолучитьМакет("X")`, object_ref = "Template") | `common_template_call`
+    //     (`ПолучитьОбщийМакет("X")`, object_ref = "CommonTemplate") |
+    //     `template_call_via_manager` (`Справочники.X.ПолучитьМакет("Y")`,
+    //     object_ref = владелец `Catalog.X`) | `template_call_via_receiver`
+    //     (метод-форма с нераспознанным приёмником — счётчик непокрытой формы) |
+    //     `common_picture`/`style_item` (общие картинки и элементы стиля) |
+    //     `common_module_via_literal` (`ОбщийМодуль("X")`/`CommonModule("X")`,
+    //     object_ref = "CommonModule.X").
     //   * `file_path`      — путь модуля относительно корня репо (forward slash).
     //   * `line`           — номер строки (1-based).
     //
