@@ -24,7 +24,7 @@ use rusqlite::params;
 use code_index_core::extension::{ParseExtrasCollector, ParsedFileCtx};
 use code_index_core::storage::Storage;
 
-use crate::code_usages::{extract_code_usages_for_index, CodeUsage};
+use crate::code_usages::{extract_code_usages_for_index, owner_ref_from_path, CodeUsage};
 
 /// repo-ключ в специфичных таблицах: в каждой БД ровно один репо = "default".
 const REPO_DEFAULT: &str = "default";
@@ -78,7 +78,10 @@ impl ParseExtrasCollector for BslParseCollector {
         }
 
         // Слой 1: обращения к объектам МД → metadata_code_usages.
-        let usages = extract_code_usages_for_index(ctx.content);
+        let usages = extract_code_usages_for_index(
+            ctx.content,
+            owner_ref_from_path(ctx.rel_path).as_deref(),
+        );
         if !usages.is_empty() {
             self.code_usages
                 .lock()
