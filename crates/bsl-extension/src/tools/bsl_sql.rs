@@ -81,17 +81,20 @@ impl IndexTool for BslSqlTool {
          usage_kind: manager | ref_type | query | \
          common_picture | style_item | template_call | \
          common_template_call | template_call_via_manager | template_call_via_receiver | \
-         common_module_via_literal; \
+         common_module_via_literal | template_call_non_literal; \
          common_picture — обращение к общей картинке (object_ref = 'CommonPicture.X': \
          'БиблиотекаКартинок.X'/'CommonPicture.X' из кода и CommonPicture.X из XML выгрузки); \
          style_item — обращение к элементу стиля (object_ref = 'StyleItem.X': \
          'ЦветаСтиля.X'/'ШрифтыСтиля.X' из кода и style:X из XML); \
          common_module_via_literal — строковый доступ к общему модулю \
-         (object_ref = 'CommonModule.X': ОбщийМодуль(\"X\")/CommonModule(\"X\")); ВНИМАНИЕ: у строк \
-         template_call_via_receiver object_ref = 'Template'/'CommonTemplate' (имя макета — \
-         в member_path), у template_call_via_manager object_ref = владелец 'Catalog.X', \
-         то есть object_ref у template* — НЕ имя объекта перечня; форма ПолучитьМакет(\"Y\") \
-         без владельца даёт object_ref='Template' и member_path='Y'), procedure_enrichment(proc_key, \
+         (object_ref = 'CommonModule.X': ОбщийМодуль(\"X\")/CommonModule(\"X\")); ВНИМАНИЕ про макеты: \
+         голая форма ПолучитьМакет(\"Y\"), приёмник-сам-объект (ЭтотОбъект/Объект) и \
+         приёмник-выражение (ПолучитьМакетОбъекта(Ссылка).ПолучитьМакет(\"Y\")) пишутся \
+         РАЗРЕШЁННОЙ ссылкой object_ref = '<Владелец>.Template.<Y>' (владелец — по пути \
+         модуля), ПолучитьОбщийМакет — 'CommonTemplate.<Y>'; метод-форма \
+         Справочники.X.ПолучитьМакет(\"Y\") пишет object_ref = 'Catalog.X' (владелец) и \
+         member_path = 'Y'; без владельца модуля (общие модули) остаётся \
+         object_ref = 'Template'/'CommonTemplate'), \
          terms, signature), direct_edge_files(caller, callee, source_file), \
          dcs_schemas(template_full_name, owner_full_name, content_file, data_sets_json, \
          links_json, calculated_fields_json, totals_json, parameters_json, variants_json, \
@@ -109,6 +112,32 @@ impl IndexTool for BslSqlTool {
          (без колонки repo): files(path, language, lines_total, mtime, file_size), \
          functions(file_id, name, qualified_name, line_start, line_end, args, return_type, \
          body, override_type, override_target), classes, imports, calls, variables. \
+         ВОПРОС «ЧТО В КОНФИГУРАЦИИ НЕ ИСПОЛЬЗУЕТСЯ» (объекты без ссылок) отвечается рецептом, \
+         без отдельного инструмента: WITH used AS (SELECT object_ref_key AS k FROM \
+         metadata_code_usages UNION SELECT object_ref || '.Template.' || member_path FROM \
+         metadata_code_usages WHERE member_path IS NOT NULL AND usage_kind = 'query' UNION \
+         SELECT object_ref || '.Template.' || lower(member_path) FROM metadata_code_usages \
+         WHERE member_path IS NOT NULL AND usage_kind = 'template_call_via_manager'), \
+         owners AS (SELECT DISTINCT object_ref_key AS ok FROM metadata_code_usages \
+         WHERE usage_kind = 'template_call_non_literal'), \
+         computed_refs AS (SELECT o.full_name_key AS k FROM metadata_objects o, owners m \
+         WHERE o.meta_type = 'Template' AND substr(o.full_name_key, 1, length(m.ok)) = m.ok \
+         AND substr(o.full_name_key, length(m.ok) + 1, 10) = '.template.') \
+         SELECT o.meta_type, COUNT(*) FROM metadata_objects o WHERE o.meta_type NOT IN \
+         ('Subsystem','Language') AND NOT EXISTS (SELECT 1 FROM data_links l WHERE \
+         l.to_object_key = o.full_name_key) AND NOT EXISTS (SELECT 1 FROM role_rights r WHERE \
+         r.object_name_key = o.full_name_key) AND o.full_name_key NOT IN (SELECT k FROM used) \
+         AND o.full_name NOT IN (SELECT k FROM used) \
+         AND o.full_name_key NOT IN (SELECT k FROM computed_refs) GROUP BY o.meta_type ORDER BY 2 DESC; \
+         имена объектов — тот же набор условий плюс SELECT o.full_name с LIMIT/OFFSET. \
+         Третья корзина — «ВЫЧИСЛЯЕМЫЕ»: строки template_call_non_literal помечают \
+         владельца, у которого имя макета собирается в рантайме (движок регламентированных \
+         отчётов); его макеты в список не попадают — на типовой конфигурации \
+         это 87 % остатка; запрос с ним считается ~1,5 с на индексе 7,9 ГБ, без него ~0,8 с — \
+         оба укладываются в лимит 8 с. Ответ — КАНДИДАТЫ, не доказательство. Не индексируются: EN-формы \
+         GetTemplate/GetCommonTemplate, вызов с переносом строки до литерала, \
+         ОбщийМодуль(Выражение) и ссылки из свойств метаданных (свойство \
+         <MainDataCompositionSchema> и подобные у шаблонов регламентированных отчётов). \
          Схему можно интроспектировать: SELECT name, sql FROM sqlite_master WHERE type='table'. \
          Пример (перехваты расширений): SELECT f.name, f.override_type, f.override_target, \
          fl.path FROM functions f JOIN files fl ON fl.id=f.file_id WHERE f.override_type \

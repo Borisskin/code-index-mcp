@@ -163,16 +163,6 @@ impl LanguageProcessor for BslLanguageProcessor {
             // список обращений без процедур и без различения чтения и записи) не
             // отвечают.
             Arc::new(crate::tools::PostingMapTool),
-            // find_unreferenced_objects — объекты без ссылок (Требование 2 ТЗ,
-            // формула c2-v3): объединяет data_links + role_rights +
-            // metadata_code_usages (+ общие картинки/элементы стиля) + канал
-            // макетов из четырёх источников (строковые пути, голая форма
-            // ПолучитьМакет("X"), метод-форма Справочники.X.ПолучитьМакет("Y"),
-            // ПолучитьОбщийМакет) + канал общих модулей (вызовы Модуль.Метод()
-            // по proc_call_graph, модули-обработчики подписок и строковый доступ
-            // ОбщийМодуль("Имя")) и честно показывает, что именно проверено
-            // (channels_applied / channels_not_applied).
-            Arc::new(crate::tools::FindUnreferencedObjectsTool),
         ]
     }
 
@@ -378,7 +368,6 @@ mod tests {
         // + find_references (карта влияния: реверс data_links + код + права)
         // + get_dcs_schema (макет СКД: наборы, поля, текст запроса, варианты)
         // + posting_map (карта механизма проведения: записи движений по регистрам).
-        // + find_unreferenced_objects (объекты без ссылок, формула c2-v3).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -399,8 +388,7 @@ mod tests {
         assert!(names.contains(&"query_call_sites"));
         assert!(names.contains(&"get_node_structure"));
         assert!(names.contains(&"get_line_context"));
-        assert!(names.contains(&"find_unreferenced_objects"));
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
