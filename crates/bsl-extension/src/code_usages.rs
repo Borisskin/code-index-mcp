@@ -1043,7 +1043,7 @@ pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
 }
 
 /// Каноническая ссылка на объект-владелец модуля по пути выгрузки:
-/// `base/Catalogs/ВидыДокументовЭДОБЗК/Ext/ManagerModule.bsl` → `Catalog.ВидыДокументовЭДОБЗК`.
+/// `base/Catalogs/ВидыДокументовЭДО/Ext/ManagerModule.bsl` → `Catalog.ВидыДокументовЭДО`.
 ///
 /// Модуль формы принадлежит тому же владельцу, что и объект:
 /// `.../X/Forms/Ф/Ext/Form/Module.bsl` → `...X`. Берётся БЛИЖАЙШАЯ к файлу пара
