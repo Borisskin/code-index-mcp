@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.11.0] — 2026-10-13
+
+**Call context and code skeleton: tools that answer WHERE a call sits — in a loop, in an exception handler, at which depth — not just who calls whom.**
+
+### Added
+
+- **`query_call_sites` — calls with their place in the code.** It answers *where* a procedure is called from: inside a loop (`in_loop`), inside a `Попытка` / try block (`in_exception`), and at which nesting depth (`depth`). No tool distinguished this before: `get_callees` returned a flat list, so "what runs in a loop during posting" had to be answered by reading an 800–2000 line module — 10–15k tokens per procedure of a single document. Narrowing is mandatory: `callee`, `caller` or `path`; without it the tool returns an error explaining why, because a broad query would have to parse the whole configuration. At most 50 modules are parsed per call, and that number is reported honestly (`files_scanned`, `files_limit`, `candidates_truncated`).
+- **`get_node_structure` — the skeleton of a procedure.** Loops, try blocks and branches with line numbers and nesting depth, bounded by `max_depth`; when cut, an explicit `depth_truncated` marker plus a hint to raise the limit.
+- **`get_line_context` — what is on a line.** The enclosing procedure, every block containing the line, and the `in_loop` / `in_exception` / `depth` flags. Useful when the line is already known from another tool's answer or from an error message.
+- **Structural parsing in the core — `parse_structure`.** A single tree walk yields both the blocks and the call context; the callee name is produced by exactly the same rule that feeds the call graph (otherwise the context would not be found for qualified calls such as `Модуль.Метод`).
+
+### Changed
+
+- **The structural layer is not stored in the database — a decision, not a trade-off.** Measurements across six configurations (a typical trade-management one, two accounting ones, a payroll one, a warehouse one and one more accounting base) showed that parsing a module costs 1.4–2.4 ms, while a stored artifact would take 0.64–0.67 % of the source volume. The artifact was dropped: database growth is **zero**, no one-off rebuild per base is needed, and the data version stays 2. The price is stated plainly: the tools parse modules on demand (0.15–0.4 s per call) and require a narrowed query.
+
+### Compatibility
+
+- The database schema did not change and the data version was not raised: no rebuild is required, and rolling back to the previous version needs none either.
+- Module text is read from what the database already stores (`file_contents`) or from disk; on an older base there is no "empty" answer — the structure comes from the current content.
+
 ## [1.10.0] — 2026-10-13
 
 **Names bound to addresses: platform entry points stopped being invisible, calls to platform global functions stopped posing as unresolved code, and template references stopped getting lost.**
