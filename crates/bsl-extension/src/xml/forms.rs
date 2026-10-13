@@ -449,13 +449,13 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <Form>
   <Commands>
-    <Command name="ЗаполнитьБилеты" id="1">
-      <Title><v8:item><v8:content>Заполнить</v8:content></v8:item></Title>
-      <Action>ЗаполнитьБилетыОбработчик</Action>
+    <Command name="ЗаполнитьПоШаблону" id="1">
+      <Title><v8:item><v8:content>Заполнить по шаблону</v8:content></v8:item></Title>
+      <Action>ЗаполнитьПоШаблонуОбработчик</Action>
       <CurrentRowUse>DontUse</CurrentRowUse>
     </Command>
-    <Command name="ОК" id="3">
-      <Action>ОК</Action>
+    <Command name="Подтвердить" id="3">
+      <Action>Подтвердить</Action>
     </Command>
   </Commands>
   <Events>
@@ -470,13 +470,13 @@ mod tests {
         );
         let cmd = handlers
             .iter()
-            .find(|h| h.event == "ЗаполнитьБилеты")
+            .find(|h| h.event == "ЗаполнитьПоШаблону")
             .expect("команда обязана разобраться");
         assert_eq!(cmd.kind, "command");
-        assert_eq!(cmd.handler, "ЗаполнитьБилетыОбработчик");
+        assert_eq!(cmd.handler, "ЗаполнитьПоШаблонуОбработчик");
         assert_eq!(cmd.element, None);
         // Заголовок команды обработчиком не становится.
-        assert!(!handlers.iter().any(|h| h.handler == "Заполнить"));
+        assert!(!handlers.iter().any(|h| h.handler == "Заполнить по шаблону"));
         // Помечаем только команды: у событий ключа `kind` в JSON нет.
         let json = handlers_to_json(&handlers).unwrap();
         assert_eq!(json.matches("\"kind\"").count(), 2, "пометка у двух команд");
