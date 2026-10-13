@@ -109,6 +109,12 @@ impl LanguageProcessor for BslLanguageProcessor {
     fn additional_tools(&self) -> Vec<Arc<dyn IndexTool>> {
         vec![
             Arc::new(crate::tools::GetObjectStructureTool),
+            // Структурный слой (ступень B): контекст вызовов и скелет кода.
+            // Хранимого артефакта нет — модуль разбирается на месте, см.
+            // `crate::tools::structure`.
+            Arc::new(crate::tools::QueryCallSitesTool),
+            Arc::new(crate::tools::GetNodeStructureTool),
+            Arc::new(crate::tools::GetLineContextTool),
             Arc::new(crate::tools::GetFormHandlersTool),
             Arc::new(crate::tools::GetEventSubscriptionsTool),
             Arc::new(crate::tools::FindPathBslTool),
@@ -379,7 +385,10 @@ mod tests {
         assert!(names.contains(&"find_references"));
         assert!(names.contains(&"get_dcs_schema"));
         assert!(names.contains(&"posting_map"));
-        assert_eq!(tools.len(), 14);
+        assert!(names.contains(&"query_call_sites"));
+        assert!(names.contains(&"get_node_structure"));
+        assert!(names.contains(&"get_line_context"));
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod get_register_writers;
 pub mod get_role_rights;
 pub mod posting_map;
 pub mod search_terms;
+pub mod structure;
 
 pub use bsl_sql::BslSqlTool;
 pub use find_data_path::FindDataPathTool;
@@ -46,6 +47,7 @@ pub use get_register_writers::GetRegisterWritersTool;
 pub use get_role_rights::GetRoleRightsTool;
 pub use posting_map::PostingMapTool;
 pub use search_terms::SearchTermsTool;
+pub use structure::{GetLineContextTool, GetNodeStructureTool, QueryCallSitesTool};
 
 use serde_json::{json, Value};
 
