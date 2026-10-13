@@ -933,8 +933,14 @@ pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
 /// где `event` — англ. имя события платформы, `name` — имя процедуры-обработчика
 /// в модуле формы. Возвращает пары `(event, handler)`; `event` приводится к
 /// русскому имени через `event_to_russian` — чтобы совпадать с форматом
-/// Конфигуратора (где события формы по-русски). Привязки команд
-/// (`<action ...><handler>`) — это не event-обработчики, их не берём.
+/// Конфигуратора (где события формы по-русски).
+///
+/// Команды формы разбираются из отдельной секции `<formCommands>`: имя команды —
+/// прямой дочерний `<name>`, процедура-обработчик — `<action><handler><name>`.
+/// Это третий вид привязки (`kind = "command"`), и он не событие: команду видно
+/// в интерфейсе как кнопку. Одиночный `<action>` вне `<formCommands>` (действие
+/// элемента) по-прежнему не берётся — процедуры в модуле формы у него может и
+/// не быть.
 pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
     // Словарь именно событий ФОРМ — общий с форматом Конфигуратора, чтобы
     // одна и та же форма в двух выгрузках давала одинаковые имена событий.
@@ -950,8 +956,19 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
     let mut in_handlers = false;
     let mut cur_event: Option<String> = None;
     let mut cur_name: Option<String> = None;
+    // Команды формы в EDT лежат отдельной секцией: `<formCommands>` с прямым
+    // `<name>` (имя команды, оно же видно на кнопке) и
+    // `<action><handler><name>` (процедура-обработчик). Раскладка отличается от
+    // Конфигуратора, где команда — `<Command name=…><Action>Процедура</Action>`,
+    // поэтому разбор свой, а результат — тот же: привязка с `kind = "command"`.
+    let mut in_form_commands = false;
+    let mut commands_depth = 0usize;
+    let mut in_action = false;
+    let mut cur_command: Option<String> = None;
+    let mut cur_command_handler: Option<String> = None;
     // 0 — нет; 1 — ждём текст <event>; 2 — ждём текст <name> обработчика;
-    // 3 — ждём текст <name> элемента формы.
+    // 3 — ждём текст <name> элемента формы; 4 — ждём текст <name> команды формы;
+    // 5 — ждём текст <name> процедуры-обработчика команды.
     let mut tt = 0u8;
     // Элементы формы вложены друг в друга тегами <items>; имя элемента —
     // прямой дочерний <name>. Владелец обработчика — ближайший открытый
@@ -972,8 +989,19 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                         cur_event = None;
                         cur_name = None;
                     }
+                    "formCommands" => {
+                        in_form_commands = true;
+                        commands_depth = depth;
+                        cur_command = None;
+                        cur_command_handler = None;
+                    }
+                    "action" if in_form_commands => in_action = true,
                     "event" if in_handlers => tt = 1,
                     "name" if in_handlers => tt = 2,
+                    // Имя команды формы: прямой дочерний <name> у <formCommands>.
+                    "name" if in_form_commands && depth == commands_depth + 1 => tt = 4,
+                    // Имя процедуры-обработчика команды: <action><handler><name>.
+                    "name" if in_action => tt = 5,
                     // Имя элемента формы: <name> прямо внутри своего <items>.
                     // Вложенные <name> подсказки и контекстного меню лежат
                     // глубже и под это условие не подходят.
@@ -1009,6 +1037,10 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                         if let Some((_, item_name)) = items_stack.last_mut() {
                             *item_name = Some(txt);
                         }
+                    } else if tt == 4 && !txt.is_empty() {
+                        cur_command = Some(txt);
+                    } else if tt == 5 && !txt.is_empty() {
+                        cur_command_handler = Some(txt);
                     }
                     tt = 0;
                 }
@@ -1022,12 +1054,30 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                             event: form_event_to_russian(&ev).to_string(),
                             handler: nm,
                             element,
-                            // Раскладка EDT: команды формы здесь пока не
-                            // разбираются, все обработчики — события.
+                            // Секция <handlers> — это события формы; команды
+                            // разбираются отдельно, из <formCommands>.
                             kind: "event",
                         });
                     }
                     in_handlers = false;
+                }
+                if local == "action" {
+                    in_action = false;
+                }
+                if local == "formCommands" {
+                    // Команда без обработчика (например, действие — открытие
+                    // формы) привязки не даёт: выдумывать процедуру нельзя.
+                    if let (Some(cmd), Some(proc)) =
+                        (cur_command.take(), cur_command_handler.take())
+                    {
+                        out.push(FormHandler {
+                            event: cmd,
+                            handler: proc,
+                            element: None,
+                            kind: "command",
+                        });
+                    }
+                    in_form_commands = false;
                 }
                 if local == "items" {
                     items_stack.pop();
@@ -1726,6 +1776,54 @@ mod tests {
         assert!(!h.iter().any(|x| x.handler == "НеБрать"));
         // Обработчики лежат в корне формы — владельца-элемента у них нет.
         assert!(h.iter().all(|x| x.element.is_none()));
+    }
+
+    /// Команда формы в EDT: имя команды — прямой `<name>` у `<formCommands>`,
+    /// процедура — `<action><handler><name>`. Платформа зовёт её так же, как
+    /// событие, и без этого разбора обработчик кнопки выглядел неиспользуемым.
+    #[test]
+    fn edt_form_command_action_is_parsed() {
+        let form = r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>
+  <formCommands>
+    <name>ЗаполнитьПоШаблону</name>
+    <id>1</id>
+    <use><common>true</common></use>
+    <action xsi:type="form:FormCommandHandlerContainer">
+      <handler><name>ЗаполнитьПоШаблонуОбработчик</name></handler>
+    </action>
+    <currentRowUse>DontUse</currentRowUse>
+  </formCommands>
+  <formCommands>
+    <name>ПоказатьСводку</name>
+    <id>2</id>
+  </formCommands>
+  <items xsi:type="form:Button">
+    <name>КнопкаШаблон</name>
+    <id>5</id>
+    <commandName>Form.Command.ЗаполнитьПоШаблону</commandName>
+  </items>
+</form:Form>"#;
+        let h = parse_mdo_form_handlers(form);
+        let cmd = h
+            .iter()
+            .find(|x| x.kind == "command")
+            .expect("команда формы должна разобраться");
+        assert_eq!(
+            cmd.event, "ЗаполнитьПоШаблону",
+            "имя команды — как на кнопке"
+        );
+        assert_eq!(cmd.handler, "ЗаполнитьПоШаблонуОбработчик");
+        assert_eq!(cmd.element, None);
+        // Событие формы осталось событием и не потерялось.
+        assert!(h
+            .iter()
+            .any(|x| x.kind == "event" && x.handler == "ПриСозданииНаСервере"));
+        // Команда без обработчика привязки не даёт.
+        assert!(!h.iter().any(|x| x.event == "ПоказатьСводку"));
+        // Имя кнопки командой не становится.
+        assert!(!h.iter().any(|x| x.event == "КнопкаШаблон"));
     }
 
     #[test]
