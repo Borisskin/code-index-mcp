@@ -1694,7 +1694,9 @@ async fn find_unreferenced_objects_end_to_end_manager_template_call() {
     mark_index_current(&storage).await;
     let src =
         "Процедура П()\n\tСхема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");\nКонецПроцедуры";
-    let usages = bsl_extension::code_usages::extract_code_usages(src);
+    // Дополнительные каналы разбора (`extract_extra_usages`) — ровно то, что
+    // кладёт в индекс индексатор для метод-формы макета.
+    let usages = bsl_extension::code_usages::extract_extra_usages(src);
     assert!(
         usages
             .iter()

@@ -1,7 +1,7 @@
 //! Инкрементальное обновление по событиям наблюдателя: пофайловые ветки
 //! и сверка состава области по описи выгрузки.
 
-use crate::code_usages::extract_code_usages;
+use crate::code_usages::extract_code_usages_for_index;
 use crate::xml::config_dump_info::parse_config_dump_info_rows;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
@@ -1139,7 +1139,7 @@ pub(crate) fn update_code_usages_for_file(
             let usages = if is_xml {
                 crate::code_usages::extract_xml_usages(&content)
             } else {
-                extract_code_usages(
+                extract_code_usages_for_index(
                     &content,
                     crate::code_usages::owner_ref_from_path(&rel).as_deref(),
                 )

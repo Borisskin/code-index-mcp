@@ -12,12 +12,12 @@ Published on Infostart: [Code Index — структурный поиск по �
 
 **Rust-native code index for AI agents. Static binary. Production-grade BSL/1C support.**
 
-One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 35 tools: 20 universal + 15 BSL-specific for 1C:Enterprise configurations.
+One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 38 tools: 20 universal + 18 BSL-specific for 1C:Enterprise configurations.
 
 ## What's inside
 
 - **Performance.** An 88K-file accounting configuration indexes from scratch in 5 min 51 s, starts up on an existing index in 5.3 s, and answers a query in about 10 ms. Production-grade for 100K+ file monorepos.
-- **35 MCP tools.** 20 universal (functions, classes, callers/callees, file content, grep) + 15 BSL-tools (object structure & profile, form handlers, event subscriptions, call graph, data links, register writers, posting mechanism map, role rights, impact map, unreferenced objects, data composition schema, read-only SQL).
+- **38 MCP tools.** 20 universal (functions, classes, callers/callees, file content, grep) + 18 BSL-tools (object structure & profile, form handlers, event subscriptions, call graph, call-site context and code skeleton (`query_call_sites`, `get_node_structure`, `get_line_context`), data links, register writers, posting mechanism map, role rights, impact map, unreferenced objects, data composition schema, read-only SQL).
 - **Native BSL/1C.** Parses both Configurator (XML) and 1C:EDT (`.mdo`) exports of 1C:Enterprise 8.3 configurations. Data-link graph (object→object edges via reference types in attributes) — 65,421 edges for a typical accounting configuration.
 - **Federation.** One MCP server can serve multiple repositories across machines — pass `repo: "alias"` in each tool call.
 - **Compressed content storage.** File contents stored in SQLite via zstd, cheap random-access reads for AI agents.

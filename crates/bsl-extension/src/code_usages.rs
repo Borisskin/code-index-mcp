@@ -13,9 +13,19 @@
 //     либо `"DocumentRef.X"` (EN);
 //   * `query`    — путь метаданных в строковом литерале (текст запроса):
 //     `Документ.X` и `Документ.X.Товары` (3-й сегмент = имя ТЧ → `member_path`).
+//   * `template` / `common_template` / `picture` — макет объекта по `owner_ref`
+//     пути модуля, `ПолучитьОбщийМакет("X")` и `БиблиотекаКартинок.X`
+//     (каналы релиза 1.10.0, `collect_template_usage`).
+//
+// Ветки `template_call*`, `common_picture`, `style_item`,
+// `common_module_via_literal` разбирает [`extract_extra_usages`]: они
+// пересекаются с базовым разбором по входу (тот же вызов `ПолучитьМакет`), и
+// один вызов не должен попасть в один набор дважды. Индексатор складывает оба
+// набора через [`extract_code_usages_for_index`], потребители фильтруют по
+// `usage_kind`.
 //   * `template_call`       — `ПолучитьМакет("Имя")`: имя макета в литерале
 //     (аргумент — ОДИН строковый литерал). Владелец макета тут НЕ резолвится —
-//     `extract_code_usages` не знает путь файла; пара (владелец, макет)
+//     дополнительный разбор не знает путь файла; пара (владелец, макет)
 //     собирается инструментом `find_unreferenced_objects` по `file_path`.
 //     `object_ref = "Template"`, `member_path = Some(имя макета)`.
 //   * `common_template_call` — `ПолучитьОбщийМакет("Имя")`: `object_ref =
@@ -905,20 +915,10 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
         in_string = carry;
 
         // manager — только в реальном коде (строки/комментарии вырезаны).
-        // Второй формой ловятся глобальные «библиотеки» (`БиблиотекаКартинок.X`,
-        // `ЦветаСтиля.X`) — это тоже пары `Идент.Идент`, но цель фиксирована.
         if code.contains('.') {
-            for (g1, g2, not_a_ref) in dotted_pairs(&code) {
-                let low = g1.to_lowercase();
-                if let Some(&canon) = manager_map().get(&low) {
+            for (g1, g2, _) in dotted_pairs(&code) {
+                if let Some(&canon) = manager_map().get(&g1.to_lowercase()) {
                     out.push(make_usage(canon, &g2, None, "manager", lineno));
-                } else if let Some(&(canon, kind)) = global_object_map().get(&low) {
-                    // E4: метод коллекции (`БиблиотекаКартинок.Есть(…)`) и доступ
-                    // к полю объекта (`Объект.БиблиотекаКартинок.Комментарий`) —
-                    // НЕ ссылки на объекты `CommonPicture`/`StyleItem`.
-                    if !not_a_ref {
-                        out.push(make_usage(canon, &g2, None, kind, lineno));
-                    }
                 }
             }
         }
@@ -945,6 +945,73 @@ pub fn extract_code_usages(content: &str, owner_ref: Option<&str>) -> Vec<CodeUs
                 }
                 if let Some(&canon) = en_reftype_map().get(&low) {
                     out.push(make_usage(canon, &g2, None, "ref_type", lineno));
+                }
+            }
+        }
+
+        // NB: дополнительные каналы (голая/метод-формы `ПолучитьМакет`,
+        // `ОбщийМодуль("Имя")`, «библиотеки» картинок и стиля) живут в
+        // [`extract_extra_usages`]: они пересекаются с макетным каналом этой
+        // функции по входу, и два независимых разбора одного вызова не
+        // складываются в один набор — индексатор берёт оба набора через
+        // [`extract_code_usages_for_index`].
+    }
+    out
+}
+
+/// Все обращения к объектам метаданных, которые кладёт в индекс индексатор:
+/// базовая ветка разбора ([`extract_code_usages`]) + дополнительные каналы
+/// ([`extract_extra_usages`]).
+///
+/// Оба набора не пересекаются по `usage_kind`, поэтому потребители
+/// (`find_references`, `find_unreferenced_objects`, `get_object_profile`)
+/// видят каждый канал ровно один раз, фильтруя по своему виду обращения.
+pub fn extract_code_usages_for_index(content: &str, owner_ref: Option<&str>) -> Vec<CodeUsage> {
+    let mut out = extract_code_usages(content, owner_ref);
+    out.extend(extract_extra_usages(content));
+    out
+}
+
+/// Дополнительные каналы обращений к объектам метаданных (ТЗ C2/D1/F1b):
+///
+///   * `template_call` / `common_template_call` — голая форма
+///     `ПолучитьМакет("Имя")` / `ПолучитьОбщийМакет("Имя")`;
+///   * `template_call_via_manager` — `Справочники.X.ПолучитьМакет("Y")`;
+///   * `template_call_via_receiver` — метод-форма с нераспознанным приёмником;
+///   * `common_module_via_literal` — `ОбщийМодуль("Имя")`;
+///   * `common_picture` / `style_item` — `БиблиотекаКартинок.X`,
+///     `ЦветаСтиля.X`, `ШрифтыСтиля.X` (фильтр «метод/поле»).
+///
+/// Отдельная функция, а не ветка [`extract_code_usages`]: у той же самой
+/// строки макетный/картиночный канал уже разбирается в
+/// [`collect_template_usage`] (он резолвит владельца по `owner_ref`), и второй
+/// разбор внутри одного набора дал бы двойные записи об одном обращении.
+pub fn extract_extra_usages(content: &str) -> Vec<CodeUsage> {
+    let mut out: Vec<CodeUsage> = Vec::new();
+    let mut in_string = false;
+
+    for (idx, raw) in content.split('\n').enumerate() {
+        let lineno = idx + 1;
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let (code, strings, carry) = scan_line(raw, in_string);
+        in_string = carry;
+
+        // Глобальные «библиотеки» (`БиблиотекаКартинок.X`, `ЦветаСтиля.X`) —
+        // пары `Идент.Идент` с фиксированной целью. Менеджеры коллекций здесь не
+        // нужны: их даёт `manager` в базовой ветке.
+        if code.contains('.') {
+            for (g1, g2, not_a_ref) in dotted_pairs(&code) {
+                let low = g1.to_lowercase();
+                if manager_map().contains_key(&low) {
+                    continue;
+                }
+                if let Some(&(canon, kind)) = global_object_map().get(&low) {
+                    // E4: метод коллекции (`БиблиотекаКартинок.Есть(…)`) и доступ
+                    // к полю объекта (`Объект.БиблиотекаКартинок.Комментарий`) —
+                    // НЕ ссылки на объекты `CommonPicture`/`StyleItem`.
+                    if !not_a_ref {
+                        out.push(make_usage(canon, &g2, None, kind, lineno));
+                    }
                 }
             }
         }
@@ -1086,7 +1153,9 @@ fn collect_template_usage(
 
     // Общая картинка: `БиблиотекаКартинок.Имя` — свойство, а не вызов.
     if code.contains('.') {
-        for (g1, g2) in dotted_pairs(code) {
+        // Третий элемент пары (признак «метод/поле», см. [`dotted_pairs`]) здесь
+        // не используется: канал `picture` оставлен как есть (см. отчёт ребейза).
+        for (g1, g2, _) in dotted_pairs(code) {
             if g1.eq_ignore_ascii_case("БиблиотекаКартинок") {
                 out.push(make_usage("CommonPicture", &g2, None, "picture", line));
             }
@@ -1215,6 +1284,16 @@ mod tests {
 
     fn kinds(c: &str) -> Vec<(String, Option<String>, &'static str)> {
         extract_code_usages(c, None)
+            .into_iter()
+            .map(|u| (u.object_ref, u.member_path, u.usage_kind))
+            .collect()
+    }
+
+    /// То же для дополнительных каналов ([`extract_extra_usages`]): они живут
+    /// отдельно от базового разбора, потому что пересекаются с ним по входу
+    /// (макеты/картинки разобраны дважды — см. `extract_code_usages_for_index`).
+    fn extra_kinds(c: &str) -> Vec<(String, Option<String>, &'static str)> {
+        extract_extra_usages(c)
             .into_iter()
             .map(|u| (u.object_ref, u.member_path, u.usage_kind))
             .collect()
@@ -1487,7 +1566,7 @@ mod tests {
 
     #[test]
     fn template_call_from_literal() {
-        let r = extract_code_usages("Схема = ПолучитьМакет(\"ПФ_MXL_Вакансия\");");
+        let r = extract_extra_usages("Схема = ПолучитьМакет(\"ПФ_MXL_Вакансия\");");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].object_ref, "Template");
         assert_eq!(r[0].object_ref_key, "template");
@@ -1498,7 +1577,7 @@ mod tests {
 
     #[test]
     fn common_template_call_from_literal() {
-        let r = extract_code_usages("Макет = ПолучитьОбщийМакет(\"ОбщаяПечатнаяФорма\");");
+        let r = extract_extra_usages("Макет = ПолучитьОбщийМакет(\"ОбщаяПечатнаяФорма\");");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].object_ref, "CommonTemplate");
         assert_eq!(r[0].object_ref_key, "commontemplate");
@@ -1508,7 +1587,7 @@ mod tests {
 
     #[test]
     fn template_calls_accept_case_space_and_both_kinds_on_one_line() {
-        let r = extract_code_usages(
+        let r = extract_extra_usages(
             "А = получитьмакет ( \"Первый\" ); Б = ПолучитьОбщийМакет(\"Второй\");",
         );
         let got: Vec<(&str, Option<&str>)> = r
@@ -1527,24 +1606,24 @@ mod tests {
     #[test]
     fn template_calls_ignored_outside_real_code_or_without_single_literal() {
         // Комментарий.
-        assert!(kinds("// ПолучитьМакет(\"X\")").is_empty());
+        assert!(extra_kinds("// ПолучитьМакет(\"X\")").is_empty());
         // Внутри строкового литерала — это текст, а не вызов.
-        assert!(extract_code_usages("С = \"ПолучитьМакет(\"\"X\"\")\";").is_empty());
+        assert!(extract_extra_usages("С = \"ПолучитьМакет(\"\"X\"\")\";").is_empty());
         // Аргумент — не один литерал: переменная, склейка, второй аргумент.
-        assert!(kinds("ПолучитьМакет(Имя)").is_empty());
-        assert!(kinds("ПолучитьМакет(\"X\" + Суффикс)").is_empty());
-        assert!(kinds("ПолучитьМакет(\"X\", Параметр)").is_empty());
+        assert!(extra_kinds("ПолучитьМакет(Имя)").is_empty());
+        assert!(extra_kinds("ПолучитьМакет(\"X\" + Суффикс)").is_empty());
+        assert!(extra_kinds("ПолучитьМакет(\"X\", Параметр)").is_empty());
         // Не наш вызов, лишь похожее имя.
-        assert!(kinds("МойПолучитьМакет(\"X\")").is_empty());
+        assert!(extra_kinds("МойПолучитьМакет(\"X\")").is_empty());
         // Пустой литерал и имя с пробелом — не идентификатор макета.
-        assert!(kinds("ПолучитьМакет(\"\")").is_empty());
-        assert!(kinds("ПолучитьМакет(\"Два слова\")").is_empty());
+        assert!(extra_kinds("ПолучитьМакет(\"\")").is_empty());
+        assert!(extra_kinds("ПолучитьМакет(\"Два слова\")").is_empty());
     }
 
     /// Метод-форма с менеджер-приёмником: владелец известен сразу (A1).
     #[test]
     fn template_call_via_manager_resolves_owner_from_receiver() {
-        let r = extract_code_usages("Схема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");");
+        let r = extract_extra_usages("Схема = Справочники.Вакансии.ПолучитьМакет(\"ПФ\");");
         // Строка даёт и `manager` (Справочники.Вакансии), и сам вызов макета.
         let tpl: Vec<&CodeUsage> = r
             .iter()
@@ -1557,7 +1636,7 @@ mod tests {
         assert_eq!(tpl[0].member_path.as_deref(), Some("ПФ"));
 
         // EN-коллекция в одну папку выгрузки.
-        let r = extract_code_usages("Схема = Catalogs.Вакансии.ПолучитьМакет(\"ПФ\");");
+        let r = extract_extra_usages("Схема = Catalogs.Вакансии.ПолучитьМакет(\"ПФ\");");
         let tpl = r
             .iter()
             .find(|u| u.usage_kind.starts_with("template"))
@@ -1569,7 +1648,7 @@ mod tests {
     /// Метод-форма с нераспознанным приёмником — непокрытая форма (A1/A2).
     #[test]
     fn template_call_via_receiver_is_counted_not_resolved() {
-        let r = extract_code_usages("Схема = ОбъектПеременная.ПолучитьМакет(\"Y\");");
+        let r = extract_extra_usages("Схема = ОбъектПеременная.ПолучитьМакет(\"Y\");");
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].usage_kind, "template_call_via_receiver");
         assert_eq!(r[0].object_ref, "Template");
@@ -1581,14 +1660,14 @@ mod tests {
     #[test]
     fn metadata_prefix_does_not_confuse_manager_receiver() {
         // Обращение к метаданным без вызова макета: template-строк нет вовсе.
-        let r = extract_code_usages("Если Метаданные.Справочники.Вакансии.Существует() Тогда");
+        let r = extract_extra_usages("Если Метаданные.Справочники.Вакансии.Существует() Тогда");
         assert!(
             r.iter().all(|u| !u.usage_kind.starts_with("template")),
             "Метаданные.Справочники.X не должен давать вызов макета: {r:?}"
         );
         // Вызов через `Метаданные.Справочники.X`: первый идентификатор цепочки
         // `Метаданные` не менеджер → владелец НЕ приписывается (непокрытая форма).
-        let r = extract_code_usages("С = Метаданные.Справочники.Вакансии.ПолучитьМакет(\"Y\");");
+        let r = extract_extra_usages("С = Метаданные.Справочники.Вакансии.ПолучитьМакет(\"Y\");");
         let tpl: Vec<&CodeUsage> = r
             .iter()
             .filter(|u| u.usage_kind.starts_with("template"))
@@ -1600,8 +1679,11 @@ mod tests {
     #[test]
     fn template_call_marker_does_not_break_neighbour_usages() {
         // Маркер литерала не должен ломать соседние извлечения на той же строке.
-        let r = extract_code_usages(
+        // Здесь нужен весь набор индексатора: `manager` даёт базовый разбор,
+        // `template_call` — дополнительные каналы.
+        let r = extract_code_usages_for_index(
             "Док = Документы.Заказ.СоздатьДокумент(); Схема = ПолучитьМакет(\"Макет1\");",
+            None,
         );
         let kinds_got: Vec<&str> = r.iter().map(|u| u.usage_kind).collect();
         assert!(kinds_got.contains(&"manager"), "{r:?}");
@@ -1611,7 +1693,7 @@ mod tests {
     #[test]
     fn template_call_line_number_is_physical() {
         let src = "А = 1;\n\nБ = ПолучитьМакет(\"Макет\");";
-        let r = extract_code_usages(src);
+        let r = extract_extra_usages(src);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].line, 3);
     }
@@ -1621,7 +1703,7 @@ mod tests {
     #[test]
     fn template_call_after_multiline_string_matches_its_own_literal() {
         let src = "Текст = \"начало\nпродолжение\"; Схема = ПолучитьМакет(\"Цель\");";
-        let r = extract_code_usages(src);
+        let r = extract_extra_usages(src);
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].usage_kind, "template_call");
         assert_eq!(r[0].member_path.as_deref(), Some("Цель"));
@@ -1632,7 +1714,7 @@ mod tests {
 
     #[test]
     fn common_module_literal_in_code_is_usage() {
-        let r = kinds("МодульСобытия = ОбщийМодуль(\"ОбменДаннымиСобытия\");");
+        let r = extra_kinds("МодульСобытия = ОбщийМодуль(\"ОбменДаннымиСобытия\");");
         assert_eq!(
             r,
             vec![(
@@ -1645,7 +1727,7 @@ mod tests {
 
     #[test]
     fn common_module_literal_en_form_and_inner_spaces() {
-        let r = kinds("M = CommonModule( \"CommonModuleName\" );");
+        let r = extra_kinds("M = CommonModule( \"CommonModuleName\" );");
         assert_eq!(
             r,
             vec![(
@@ -1661,22 +1743,25 @@ mod tests {
     /// идентификатора (`ОбщегоНазначенияОбщийМодуль(…)` — обёртка БСП).
     #[test]
     fn common_module_literal_ignored_outside_real_code_or_without_single_literal() {
-        assert!(kinds("Модуль = ОбщийМодуль(Имя);").is_empty());
-        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен\" + Суффикс);").is_empty());
-        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен\", Параметр);").is_empty());
-        assert!(kinds("Модуль = ОбщийМодуль(\"Обмен Данными\");").is_empty());
-        assert!(kinds("Модуль = ОбщийМодуль(\"\");").is_empty());
-        assert!(kinds("Модуль = Переменная.ОбщийМодуль(\"Обмен\");").is_empty());
-        assert!(kinds("Модуль = ОбщегоНазначенияОбщийМодуль(\"Обмен\");").is_empty());
-        assert!(kinds("// ОбщийМодуль(\"Обмен\")").is_empty());
-        assert!(kinds("С = \"ОбщийМодуль(\"\"Обмен\"\")\";").is_empty());
+        assert!(extra_kinds("Модуль = ОбщийМодуль(Имя);").is_empty());
+        assert!(extra_kinds("Модуль = ОбщийМодуль(\"Обмен\" + Суффикс);").is_empty());
+        assert!(extra_kinds("Модуль = ОбщийМодуль(\"Обмен\", Параметр);").is_empty());
+        assert!(extra_kinds("Модуль = ОбщийМодуль(\"Обмен Данными\");").is_empty());
+        assert!(extra_kinds("Модуль = ОбщийМодуль(\"\");").is_empty());
+        assert!(extra_kinds("Модуль = Переменная.ОбщийМодуль(\"Обмен\");").is_empty());
+        assert!(extra_kinds("Модуль = ОбщегоНазначенияОбщийМодуль(\"Обмен\");").is_empty());
+        assert!(extra_kinds("// ОбщийМодуль(\"Обмен\")").is_empty());
+        assert!(extra_kinds("С = \"ОбщийМодуль(\"\"Обмен\"\")\";").is_empty());
     }
 
     /// Соседние извлечения на той же строке не ломаются (маркер литерала).
     #[test]
     fn common_module_literal_does_not_break_neighbour_usages() {
-        let r = extract_code_usages(
+        // Весь набор индексатора: `manager` приходит из базового разбора,
+        // наш строковый канал — из дополнительных.
+        let r = extract_code_usages_for_index(
             "Схема = ПолучитьМакет(\"Макет1\"); М = ОбщийМодуль(\"Обмен\"); Д = Документы.Заказ;",
+            None,
         );
         let got: Vec<(&str, &str)> = r
             .iter()
@@ -1700,7 +1785,7 @@ mod tests {
     #[test]
     fn picture_library_in_code_is_common_picture() {
         // RU-форма обращения к общей библиотеке картинок (реальный синтаксис).
-        let r = kinds("Картинка = БиблиотекаКартинок.Комментарий;");
+        let r = extra_kinds("Картинка = БиблиотекаКартинок.Комментарий;");
         assert_eq!(
             r,
             vec![(
@@ -1710,13 +1795,13 @@ mod tests {
             )]
         );
         // EN-форма свойства глобального контекста.
-        let r = kinds("Pic = PictureLibrary.Answer;");
+        let r = extra_kinds("Pic = PictureLibrary.Answer;");
         assert_eq!(
             r,
             vec![("CommonPicture.Answer".to_string(), None, "common_picture")]
         );
         // Форма метаданного (в XML встречается как CommonPicture.X).
-        let r = kinds("P = CommonPicture.Информация32;");
+        let r = extra_kinds("P = CommonPicture.Информация32;");
         assert_eq!(
             r,
             vec![(
@@ -1729,7 +1814,7 @@ mod tests {
 
     #[test]
     fn style_collection_in_code_is_style_item() {
-        let r = kinds("Цвет = ЦветаСтиля.ПросроченныеДанныеЦвет;");
+        let r = extra_kinds("Цвет = ЦветаСтиля.ПросроченныеДанныеЦвет;");
         assert_eq!(
             r,
             vec![(
@@ -1738,7 +1823,7 @@ mod tests {
                 "style_item"
             )]
         );
-        let r = kinds("Ш = ШрифтыСтиля.КрупныйШрифтТекста;");
+        let r = extra_kinds("Ш = ШрифтыСтиля.КрупныйШрифтТекста;");
         assert_eq!(
             r,
             vec![(
@@ -1747,7 +1832,7 @@ mod tests {
                 "style_item"
             )]
         );
-        let r = kinds("C = StyleColors.AccentColor;");
+        let r = extra_kinds("C = StyleColors.AccentColor;");
         assert_eq!(
             r,
             vec![("StyleItem.AccentColor".to_string(), None, "style_item")]
@@ -1757,8 +1842,8 @@ mod tests {
     #[test]
     fn picture_and_style_ignored_in_strings_and_comments() {
         // В строке/комментарии это текст, а не обращение.
-        assert!(kinds("С = \"БиблиотекаКартинок.Папка\";").is_empty());
-        assert!(kinds("// ЦветаСтиля.ЦветФонаФормы").is_empty());
+        assert!(extra_kinds("С = \"БиблиотекаКартинок.Папка\";").is_empty());
+        assert!(extra_kinds("// ЦветаСтиля.ЦветФонаФормы").is_empty());
     }
 
     /// E4: метод коллекции и доступ к полю НЕ являются ссылками на объекты
@@ -1768,20 +1853,20 @@ mod tests {
         // (а) метод коллекции: `БиблиотекаКартинок.Есть(Имя)` — метод, а не
         // обращение к объекту `CommonPicture.Есть`.
         assert!(
-            kinds("Если БиблиотекаКартинок.Есть(Имя) Тогда").is_empty(),
+            extra_kinds("Если БиблиотекаКартинок.Есть(Имя) Тогда").is_empty(),
             "метод библиотеки картинок не должен давать common_picture"
         );
         // (б) доступ к полю объекта: `<Объект>.БиблиотекаКартинок.Комментарий`.
         assert!(
-            kinds("К = МойОбъект.БиблиотекаКартинок.Комментарий;").is_empty(),
+            extra_kinds("К = МойОбъект.БиблиотекаКартинок.Комментарий;").is_empty(),
             "поле объекта не должно давать common_picture"
         );
         // То же правило для элементов стиля.
-        assert!(kinds("Ц = МойОбъект.ЦветаСтиля.ЦветФона;").is_empty());
-        assert!(kinds("Ш = МойОбъект.ШрифтыСтиля.Шрифт;").is_empty());
-        assert!(kinds("Р = МойОбъект.РамкиСтиля.Рамка;").is_empty());
+        assert!(extra_kinds("Ц = МойОбъект.ЦветаСтиля.ЦветФона;").is_empty());
+        assert!(extra_kinds("Ш = МойОбъект.ШрифтыСтиля.Шрифт;").is_empty());
+        assert!(extra_kinds("Р = МойОбъект.РамкиСтиля.Рамка;").is_empty());
         // Настоящее обращение (без метода/поля) остаётся видимым.
-        let r = kinds("К = БиблиотекаКартинок.Комментарий;");
+        let r = extra_kinds("К = БиблиотекаКартинок.Комментарий;");
         assert_eq!(
             r,
             vec![(
@@ -1791,7 +1876,7 @@ mod tests {
             )]
         );
         // И обычная ссылка на элемент стиля тоже.
-        let r = kinds("Ц = ЦветаСтиля.ПросроченныеДанныеЦвет;");
+        let r = extra_kinds("Ц = ЦветаСтиля.ПросроченныеДанныеЦвет;");
         assert_eq!(
             r,
             vec![(
