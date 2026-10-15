@@ -5,6 +5,25 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.13.0] — 2026-10-15
+
+**A silent filter and a silent re-read: the response now says a key was not applied, the re-read says a restart is required.**
+
+### Added
+
+- **`unknown_params` in the tool response.** A key the tool does not have was dropped while parsing the arguments, silently: a call with a foreign filter name (`glob` instead of `path_glob`, `start_line` instead of `line_start`) looked healthy while the filter was not applied. The response now carries `unknown_params` — what was not recognised — and `unknown_params_note` listing the keys the tool does accept. The call is not rejected: the server still answers with data. The check follows the core tool schema; 1C tools have hand-written schemas and for some of them the key name is deliberately insignificant, so no warning is emitted there — a false signal is worse than silence.
+- **`path_glob` and `ambiguous_name` for `get_callers`/`get_callees`.** For same-named methods (`Dispose`, `RunAsync`, `new`) the calls of different definitions arrive as one list, and the graph edge carries no class (receiver type). `path_glob` narrows the result by the path of the call's SOURCE file (SQL pushdown; for 1C the same filter also drops qualified calls and declarative bindings), while `ambiguous_name` reports how many definitions share the name — with `qualified_name`, path and line. When the filter is what emptied the result, the hint names the filter rather than only the function name.
+
+### Changed
+
+- **Key synonyms.** `glob` is accepted as `path_glob` in `grep_code`, `grep_text` and `grep_body`, `start_line`/`end_line` as `line_start`/`line_end` in `read_file`, and `depth` as `max_depth` in `get_call_tree`. The canonical key wins when both are present.
+- **Re-reading `daemon.toml` names the sections it does not apply.** `[mcp]`, `[tools]` and `[cap]` are read once, when `serve` is built; an edit to them now lands in `restart_required` and in the log (a WARN naming the sections). Previously the log said "re-read without changes" and an edit to `mass_mode_tools` looked applied. Values of the parsed config are compared, so editing a comment or spelling out a default value does not require a restart.
+- **The empty `grep_code` hint** no longer claims the key was named wrongly: it lists the accepted keys (`regex`, `pattern`, the `query` synonym).
+
+### Compatibility
+
+- No reindex required: the database schema and the storage format are unchanged — the changes live in the response layer.
+
 ## [1.12.0] — 2026-10-14
 
 **Objects with no references: which references were counted, which forms are not indexed, and why "no references" is not a verdict.**
