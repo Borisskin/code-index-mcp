@@ -12,7 +12,8 @@
 // - `event_subscriptions` — *.xml в EventSubscriptions/: связь
 //   «событие → модуль.процедура». Источник для `event_subscriptions`.
 // - `object_attributes` — XML отдельных объектов (Catalogs/<X>.xml и т.д.):
-//   ссылочные типы реквизитов/измерений → рёбра графа связей данных.
+//   ссылочные типы реквизитов/измерений и свойства-ссылки шапки
+//   (`<MainDataCompositionSchema>`) → рёбра графа связей данных.
 //   Источник для `data_links`.
 // - `metadata_refs` — связи КОНФИГУРАЦИОННОГО уровня (состав подсистем и
 //   планов обмена, типы определяемых типов, расположение функциональных
@@ -41,6 +42,39 @@ impl BytesTextExt for BytesText<'_> {
         let unescaped = quick_xml::escape::unescape(&decoded).map_err(|_| ())?;
         Ok(Cow::Owned(unescaped.into_owned()))
     }
+}
+
+/// Имя свойства метаданных, значение которого — ссылка на другой объект:
+/// основная схема компоновки данных отчёта (`<MainDataCompositionSchema>` в
+/// формате Конфигуратора, `<mainDataCompositionSchema>` в EDT). Идёт в
+/// `data_links` ребром `link_kind = "metadata_property"`: `from_object` —
+/// владелец свойства, `from_path` — это имя, `to_object` — цель ссылки.
+pub(crate) const PROPERTY_REF_MAIN_DCS: &str = "MainDataCompositionSchema";
+
+/// Значение свойства метаданных, чья форма — готовая ссылка на объект
+/// (`<MainDataCompositionSchema>Report.X.Template.ОсновнаяСхемаКомпоновкиДанных</MainDataCompositionSchema>`,
+/// `<VariantsStorage>SettingsStorage.Y</VariantsStorage>`). Возвращает
+/// каноническое имя, если строка на ссылку похожа: без пробелов, первый сегмент
+/// — известный тип метаданных ([`configuration::KNOWN_META_TYPES`]), сегменты
+/// непустые.
+///
+/// Ссылкой НЕ считаются: пустое значение (`<MainDataCompositionSchema/>` —
+/// основная схема не задана), идентификатор выгрузки расширения вместо имени,
+/// скаляр (`true`, `SpreadsheetDocument`) и любое значение со `*` (обобщённый
+/// тип — из XML свойств не приходит).
+pub(crate) fn metadata_reference(value: &str) -> Option<&str> {
+    let v = value.trim();
+    if v.len() < 3 || v.chars().any(char::is_whitespace) || v.starts_with('*') {
+        return None;
+    }
+    let (head, rest) = v.split_once('.')?;
+    if !configuration::KNOWN_META_TYPES.contains(&head) {
+        return None;
+    }
+    if rest.split('.').any(|seg| seg.is_empty()) {
+        return None;
+    }
+    Some(v)
 }
 
 pub mod config_dump_info;

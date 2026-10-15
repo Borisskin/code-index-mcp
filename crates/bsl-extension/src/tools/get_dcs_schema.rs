@@ -16,8 +16,10 @@
 // Вход — имя макета (`Report.Отчет.Template.Схема`), имя владельца
 // (`Report.Отчет`) либо имя общего макета (`CommonTemplate.Схема`). По
 // владельцу отдаются ВСЕ его схемы: «основную» инструмент не помечает —
-// признака `MainDataCompositionSchema` в паспортах макетов сегодня нет, и
-// выдумывать его нельзя.
+// признака в паспортах макетов нет, и выдумывать его нельзя. Где основная схема
+// отчёта известна точно, видно в графе: ребро `data_links` вида
+// `metadata_property` (`from_path = MainDataCompositionSchema`) ведёт от отчёта
+// к его макету СКД.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -193,7 +195,8 @@ fn full_name_arg(args: &Value) -> Option<String> {
 
 /// Полные имена схем: сперва точное совпадение по имени макета, иначе — все
 /// схемы владельца (сортировка по имени; «основная» НЕ помечается и порядок не
-/// меняется — признака `MainDataCompositionSchema` в паспортах макетов нет).
+/// меняется — в паспортах макетов признака нет; основная схема отчёта видна
+/// отдельно, ребром `data_links` вида `metadata_property`).
 fn resolve_templates(conn: &rusqlite::Connection, full_name: &str) -> Vec<String> {
     let exact: Option<String> = conn
         .query_row(

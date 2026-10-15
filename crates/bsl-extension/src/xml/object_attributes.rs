@@ -52,7 +52,7 @@ use quick_xml::Reader;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{general_ref_text, BytesTextExt};
+use super::{general_ref_text, metadata_reference, BytesTextExt, PROPERTY_REF_MAIN_DCS};
 
 /// Страховочный предел на число конкретных типов в составном реквизите.
 /// Перечни в реальных конфигурациях короткие (2–20); если перечислено
@@ -128,6 +128,11 @@ enum TextTarget {
     /// Значение свойства проведения документа (Posting / RegisterRecordsDeletion
     /// и т.п.); имя свойства лежит в `cur_posting_prop`.
     PostingProp,
+    /// Свойство шапки, значение которого — ССЫЛКА на другой объект метаданных
+    /// (`<MainDataCompositionSchema>` отчёта, см. [`PROPERTY_REF_MAIN_DCS`]).
+    /// Возникает только в парсере связей данных; структурный парсер такую цель
+    /// не ставит и вариант пропускает.
+    PropertyRef,
 }
 
 /// Распарсить содержимое XML объекта в список рёбер связей данных.
@@ -207,6 +212,18 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     }
                     "Item" if in_owners => {
                         text_target = TextTarget::OwnerRef;
+                    }
+                    // Свойство шапки, значение которого — ССЫЛКА на другой объект
+                    // метаданных: <MainDataCompositionSchema> отчёта указывает его
+                    // основную схему компоновки данных
+                    // (`Report.X.Template.ОсновнаяСхемаКомпоновкиДанных`). Из кода
+                    // такой макет не берут — его открывает платформа по свойству,
+                    // — поэтому без ребра он выглядит неиспользуемым (C2).
+                    // Учёта глубины не требует: тег встречается в файле объекта
+                    // ровно один раз, в его собственных <Properties> (замер
+                    // выгрузки: 208 файлов Reports/*.xml, по одному вхождению).
+                    PROPERTY_REF_MAIN_DCS if field.is_none() => {
+                        text_target = TextTarget::PropertyRef;
                     }
                     _ => {
                         // Различаем контейнер <Type> и элемент <v8:Type>.
@@ -288,6 +305,22 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                                     is_universal: false,
                                 });
                             }
+                        // Свойство-ссылка шапки → ребро metadata_property. Цель —
+                        // каноническое имя объекта прямо из XML
+                        // (`Report.X.Template.Y`, `CommonTemplate.Y`); значение не
+                        // в форме ссылки (пусто, скаляр, идентификатор выгрузки
+                        // расширения) ребра не даёт.
+                        TextTarget::PropertyRef => {
+                            if let Some(target) = metadata_reference(&txt) {
+                                out.push(DataLinkEdge {
+                                    from_path: PROPERTY_REF_MAIN_DCS.to_string(),
+                                    to_object: target.to_string(),
+                                    link_kind: "metadata_property",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
                         // Прочие цели (свойства шапки/проведения, синонимы,
                         // FillChecking, корневой Type) в парсере связей данных не
                         // возникают — их обрабатывает parse_object_structure_xml.
@@ -1330,6 +1363,9 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                         TextTarget::None => {}
                         // RegisterRef в структурном парсере не возникает.
                         TextTarget::RegisterRef => {}
+                        // Свойство-ссылку шапки читает парсер связей данных
+                        // (`parse_object_attributes_xml`) — здесь цель не ставится.
+                        TextTarget::PropertyRef => {}
                     }
                     text_target = TextTarget::None;
                 }
@@ -1891,6 +1927,67 @@ mod tests {
         let attr = edges.iter().find(|e| e.from_path == "Контрагент").unwrap();
         assert_eq!(attr.link_kind, "attr");
         assert_eq!(attr.to_object, "Catalog.Контрагенты");
+    }
+
+    /// Свойство-ссылка шапки отчёта: `<MainDataCompositionSchema>` даёт ребро
+    /// `metadata_property` (владелец свойства → макет), пустое значение, скаляр
+    /// и неизвестный тип ссылкой не считаются.
+    #[test]
+    fn parses_main_data_composition_schema_property() {
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Report uuid="root">
+    <Properties>
+      <Name>АнализПравДоступа</Name>
+      <DefaultForm/>
+      <MainDataCompositionSchema>Report.АнализПравДоступа.Template.Макет</MainDataCompositionSchema>
+      <VariantsStorage>SettingsStorage.ХранилищеВариантовОтчетов</VariantsStorage>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>Организация</Name>
+          <Type><v8:Type>cfg:CatalogRef.Организации</v8:Type></Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Report>
+</MetaDataObject>"#;
+        let edges = parse_object_attributes_xml(xml).unwrap();
+        let props: Vec<_> = edges
+            .iter()
+            .filter(|e| e.link_kind == "metadata_property")
+            .collect();
+        assert_eq!(props.len(), 1, "ровно одно свойство-ссылка: {:?}", edges);
+        assert_eq!(props[0].from_path, "MainDataCompositionSchema");
+        assert_eq!(
+            props[0].to_object,
+            "Report.АнализПравДоступа.Template.Макет"
+        );
+        assert!(!props[0].is_composite && !props[0].is_universal);
+        // Реквизит шапки рядом разбирается как обычно.
+        assert!(edges
+            .iter()
+            .any(|e| e.from_path == "Организация" && e.link_kind == "attr"));
+
+        // Не ссылка: пустое свойство, скаляр, имя без типа, чужой первый сегмент.
+        for value in [
+            "",
+            "true",
+            "SpreadsheetDocument",
+            "ОсновнаяСхемаКомпоновкиДанных",
+            "Unknown.Что-то",
+        ] {
+            let xml = format!(
+                "<MetaDataObject><Report><Properties><Name>Отчет</Name>\
+                 <MainDataCompositionSchema>{value}</MainDataCompositionSchema>\
+                 </Properties><ChildObjects/></Report></MetaDataObject>"
+            );
+            let e = parse_object_attributes_xml(&xml).unwrap();
+            assert!(
+                e.iter().all(|x| x.link_kind != "metadata_property"),
+                "значение {value:?} ссылкой не является: {e:?}"
+            );
+        }
     }
 
     #[test]

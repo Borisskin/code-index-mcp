@@ -2498,6 +2498,82 @@ fn fills_metadata_refs_and_role_rights() {
     assert_eq!(rr_total, 1, "role_rights после повтора");
 }
 
+/// Фикстура отчёта со свойством-ссылкой `<MainDataCompositionSchema>`: основная
+/// схема компоновки данных лежит отдельным макетом, из кода её не берут.
+const REPORT_MAIN_DCS: &str = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Report uuid="root">
+    <Properties>
+      <Name>АнализПравДоступа</Name>
+      <MainDataCompositionSchema>Report.АнализПравДоступа.Template.Макет</MainDataCompositionSchema>
+    </Properties>
+    <ChildObjects>
+      <Template>Макет</Template>
+    </ChildObjects>
+  </Report>
+</MetaDataObject>"#;
+
+/// Цели рёбер `metadata_property` (свойства-ссылки шапки), по порядку.
+fn metadata_property_targets(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT to_object FROM data_links WHERE link_kind = 'metadata_property' \
+             AND from_path = 'MainDataCompositionSchema' ORDER BY to_object",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Ссылка из свойства метаданных: `<MainDataCompositionSchema>` отчёта даёт
+/// ребро `data_links` владелец → макет. Без него макет регламентированного
+/// отчёта выглядел неиспользуемым: из кода его не берут. Правка свойства
+/// переписывает ребро (инкремент), повторный полный прогон не плодит дубли.
+#[test]
+fn main_dcs_property_links_template() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects/></Configuration></MetaDataObject>"#,
+    );
+    let report = repo.join("Reports").join("АнализПравДоступа.xml");
+    write(&report, REPORT_MAIN_DCS);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(
+        metadata_property_targets(storage.conn()),
+        vec!["Report.АнализПравДоступа.Template.Макет".to_string()],
+        "свойство шапки должно дать ребро metadata_property"
+    );
+
+    // Правка свойства: цель ребра меняется, прежнее ребро не остаётся.
+    write(
+        &report,
+        &REPORT_MAIN_DCS.replace(
+            "Report.АнализПравДоступа.Template.Макет",
+            "CommonTemplate.ОбщаяСхемаКомпоновкиДанных",
+        ),
+    );
+    run_incremental_extras(&repo, &mut storage, &[report], &[]).unwrap();
+    assert_eq!(
+        metadata_property_targets(storage.conn()),
+        vec!["CommonTemplate.ОбщаяСхемаКомпоновкиДанных".to_string()],
+        "инкремент должен переписать ребро свойства, а не оставить старое"
+    );
+
+    // Повторный полный прогон идемпотентен.
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(
+        metadata_property_targets(storage.conn()).len(),
+        1,
+        "ребро свойства не должно дублироваться"
+    );
+}
+
 #[test]
 fn incremental_rebuilds_metadata_refs_and_role_rights() {
     let tmp = TempDir::new().unwrap();

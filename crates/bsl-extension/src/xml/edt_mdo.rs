@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::forms::FormHandler;
-use super::{general_ref_text, BytesTextExt};
+use super::{general_ref_text, metadata_reference, BytesTextExt, PROPERTY_REF_MAIN_DCS};
 
 use super::object_attributes::{
     classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
@@ -495,8 +495,9 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
 }
 
 /// Распарсить `.mdo` объекта в рёбра графа связей данных (`data_links`):
-/// ссылочные реквизиты/измерения → рёбра, плюс движения документа
-/// (`<registerRecords>` → `recorder`).
+/// ссылочные реквизиты/измерения → рёбра, движения документа
+/// (`<registerRecords>` → `recorder`), плюс свойства-ссылки шапки
+/// (`<mainDataCompositionSchema>` → `metadata_property`).
 pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut reader = Reader::from_str(content);
     // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
@@ -513,6 +514,9 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
         TypeValue,
         RegisterRec,
         OwnerRef,
+        /// Свойство шапки, значение которого — ссылка на другой объект
+        /// (`<mainDataCompositionSchema>`; см. [`PROPERTY_REF_MAIN_DCS`]).
+        PropertyRef,
     }
 
     let mut in_std = false;
@@ -586,6 +590,14 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     "registerRecords" if field.is_none() => {
                         tt = T::RegisterRec;
                     }
+                    // Свойство-ссылка шапки: в EDT оно camelCase, в формате
+                    // Конфигуратора — `<MainDataCompositionSchema>`. Владелец
+                    // свойства — сам объект (`field.is_none()`), значение —
+                    // каноническое имя макета. Ребро то же, что у формата
+                    // Конфигуратора, — графы двух выгрузок не расходятся.
+                    "mainDataCompositionSchema" if field.is_none() => {
+                        tt = T::PropertyRef;
+                    }
                     _ => {}
                 }
             }
@@ -643,6 +655,21 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                                     from_path: String::new(),
                                     to_object: txt,
                                     link_kind: "owner",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
+                        // Свойство-ссылка шапки → ребро metadata_property:
+                        // `from_path` — каноническое имя свойства (как в формате
+                        // Конфигуратора), `to_object` — цель из XML. Значение не в
+                        // форме ссылки (пусто, скаляр, идентификатор) ребра не даёт.
+                        T::PropertyRef => {
+                            if let Some(target) = metadata_reference(&txt) {
+                                edges.push(DataLinkEdge {
+                                    from_path: PROPERTY_REF_MAIN_DCS.to_string(),
+                                    to_object: target.to_string(),
+                                    link_kind: "metadata_property",
                                     is_composite: false,
                                     is_universal: false,
                                 });
@@ -1676,6 +1703,40 @@ mod tests {
             .map(|e| e.to_object.as_str())
             .collect();
         assert_eq!(owners, vec!["Catalog.Контрагенты", "Catalog.Организации"]);
+    }
+
+    /// Свойство-ссылка шапки в EDT (`<mainDataCompositionSchema>`) даёт то же
+    /// ребро `metadata_property`, что и `<MainDataCompositionSchema>` формата
+    /// Конфигуратора, — с каноническим `from_path`, чтобы графы двух форматов
+    /// не расходились. Пустое свойство ребра не даёт.
+    #[test]
+    fn main_data_composition_schema_gives_edge() {
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Report xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="r">
+  <name>АнализНачисленийИУдержаний</name>
+  <mainDataCompositionSchema>Report.АнализНачисленийИУдержаний.Template.ОсновнаяСхемаКомпоновкиДанных</mainDataCompositionSchema>
+  <templates uuid="t1"><name>ОсновнаяСхемаКомпоновкиДанных</name></templates>
+</mdclass:Report>"#;
+        let edges = parse_mdo_datalinks_xml(mdo).unwrap();
+        let props: Vec<_> = edges
+            .iter()
+            .filter(|e| e.link_kind == "metadata_property")
+            .collect();
+        assert_eq!(props.len(), 1, "одно свойство-ссылка: {:?}", edges);
+        assert_eq!(props[0].from_path, "MainDataCompositionSchema");
+        assert_eq!(
+            props[0].to_object,
+            "Report.АнализНачисленийИУдержаний.Template.ОсновнаяСхемаКомпоновкиДанных"
+        );
+
+        // Основная схема не задана — EDT пишет свойство пустым элементом.
+        let empty = r#"<mdclass:Report xmlns:mdclass="m" uuid="r">
+  <name>Отчет</name><mainDataCompositionSchema/></mdclass:Report>"#;
+        let e = parse_mdo_datalinks_xml(empty).unwrap();
+        assert!(
+            e.iter().all(|x| x.link_kind != "metadata_property"),
+            "пустое свойство ребра не даёт: {e:?}"
+        );
     }
 
     #[test]

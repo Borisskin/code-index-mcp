@@ -4,9 +4,11 @@
 //
 //   * data_links (реверс по to_object, idx_dl_to) — кто ссылается на объект
 //     через реквизиты/измерения (attr/tabular_attr/register_dim), движения
-//     (recorder), владение (owner), а также состав подсистем/планов обмена и
-//     определяемые типы (subsystem_content/exchange_plan_content/
-//     defined_type_content) — «структурные» ссылки из метаданных-XML;
+//     (recorder), владение (owner), ссылки из СВОЙСТВ метаданных
+//     (metadata_property: `<MainDataCompositionSchema>` отчёта → его макет),
+//     а также состав подсистем/планов обмена и определяемые типы
+//     (subsystem_content/exchange_plan_content/defined_type_content) —
+//     «структурные» ссылки из метаданных-XML;
 //   * metadata_code_usages (по object_ref) — обращения В КОДЕ (.bsl): менеджер
 //     коллекции, тип-ссылка в литерале, путь метаданных в тексте запроса,
 //     обращения к общим картинкам (`CommonPicture.X`) и элементам стиля

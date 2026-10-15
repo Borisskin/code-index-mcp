@@ -101,7 +101,10 @@ impl IndexTool for BslSqlTool {
          templates_count, *_count), dcs_datasets(template_full_name, data_set_name, kind, \
          data_source, object_name, query_text, fields_json, parent_set). \
          link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner \
-         (owner: подчинённый справочник → владелец); dcs_query — макет СКД читает объект \
+         (owner: подчинённый справочник → владелец); metadata_property — ссылка из \
+         СВОЙСТВА метаданных (from_object — владелец свойства, from_path — имя свойства, \
+         to_object — цель; сегодня это <MainDataCompositionSchema> отчёта → его макет); \
+         dcs_query — макет СКД читает объект \
          (from_object — владелец макета, from_path — «<Макет>.<Набор>»); \
          конфиг-уровень subsystem_content/exchange_plan_content/defined_type_content/\
          functional_option_location/functional_option_content (from_object соответственно \
@@ -136,8 +139,8 @@ impl IndexTool for BslSqlTool {
          это 87 % остатка; запрос с ним считается ~1,5 с на индексе 7,9 ГБ, без него ~0,8 с — \
          оба укладываются в лимит 8 с. Ответ — КАНДИДАТЫ, не доказательство. Не индексируются: EN-формы \
          GetTemplate/GetCommonTemplate, вызов с переносом строки до литерала, \
-         ОбщийМодуль(Выражение) и ссылки из свойств метаданных (свойство \
-         <MainDataCompositionSchema> и подобные у шаблонов регламентированных отчётов). \
+         ОбщийМодуль(Выражение). Ссылки из свойства <MainDataCompositionSchema> \
+         индексируются ребром data_links вида metadata_property (см. link_kind). \
          Схему можно интроспектировать: SELECT name, sql FROM sqlite_master WHERE type='table'. \
          Пример (перехваты расширений): SELECT f.name, f.override_type, f.override_target, \
          fl.path FROM functions f JOIN files fl ON fl.id=f.file_id WHERE f.override_type \
