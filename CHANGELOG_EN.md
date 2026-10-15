@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**Metadata-property references: the report's main data composition schema is no longer reported as unused.**
+
+### Added
+
+- **New `metadata_property` edge kind in `data_links`.** An object property whose value is a reference to another metadata object now lands in the link graph: `<MainDataCompositionSchema>Report.X.Template.ОсновнаяСхемаКомпоновкиДанных</...>` in the Designer dump and `<mainDataCompositionSchema>` in the 1C:EDT dump produce the same edge `Report.X → Report.X.Template.ОсновнаяСхемаКомпоновкиДанных` with `from_path = MainDataCompositionSchema`. Code never fetches such a template — the platform opens it via the property — so regulated-report schemas used to fall into the dead-code recipe in the `bsl_sql` description. A value that is not shaped like a reference (empty property, scalar, extension-dump identifier) yields no edge; the edge is visible in `get_data_links`, `find_references`, `get_object_profile` and `bsl_sql`.
+
+### Compatibility
+
+- **Reindexing is required** (`index --force`): the data version number is raised to 4 and the extras phase-semantics version to 2, so the "data links" phase is rebuilt on the next full pass. The table schema is unchanged, but an index built by an earlier version has no `metadata_property` edges, and regulated-report templates still show up as unused objects.
+
 ## [1.13.1] — 2026-10-15
 
 **Dependency update driven by the security gate: the TLS library carried four advisories.**

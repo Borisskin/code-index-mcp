@@ -59,7 +59,7 @@
 | `metadata_forms` | Управляемые формы и их обработчики событий |
 | `event_subscriptions` | Подписки на события из `EventSubscriptions/*.xml` |
 | `proc_call_graph` | Граф вызовов процедур BSL (caller→callee, `call_type`) |
-| `data_links` | Граф связей данных: рёбра объект→объект по ссылочным типам (attr / tabular_attr / register_dim / recorder / owner / subsystem_content / …) |
+| `data_links` | Граф связей данных: рёбра объект→объект по ссылочным типам (attr / tabular_attr / register_dim / recorder / owner / metadata_property / subsystem_content / …) |
 | `role_rights` | Права ролей на объекты из `Roles/<X>/Ext/Rights.xml` |
 | `metadata_code_usages` | Обратный индекс обращений к объектам метаданных в коде `.bsl` |
 | `procedure_enrichment` | Смысловые термы процедур (механические + опц. LLM-обогащение) |
