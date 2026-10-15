@@ -1835,24 +1835,24 @@ impl Storage {
         function_name: &str,
         language: Option<&str>,
     ) -> Result<Vec<CallRecord>> {
-        match language {
-            Some(lang) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
-                     FROM calls c JOIN files fi ON fi.id = c.file_id
-                     WHERE c.caller = ?1 AND fi.language = ?2",
-                )?;
-                let rows = stmt.query_map(params![function_name, lang], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, file_id, caller, callee, line FROM calls WHERE caller = ?1",
-                )?;
-                let rows = stmt.query_map(params![function_name], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
-            }
-        }
+        self.get_callees_filtered(function_name, language, None)
+    }
+
+    /// Как [`Self::get_callees`], но с фильтром по пути файла-ИСТОЧНИКА вызова.
+    ///
+    /// `path_glob` — тот же синтаксис, что у `grep_*` и `list_files`: `*`
+    /// матчит и `/` (рекурсивно), `**` схлопывается в `*`, `{a,b}` — группы
+    /// альтернатив. Фильтр нужен там, где имя неоднозначно: у `Dispose`,
+    /// `RunAsync`, `new` вызовы разных классов сливаются в один список, а
+    /// различающего поля (класс, тип приёмника) в ребре графа нет — путь файла
+    /// остаётся единственным проверяемым отбором (issue #22).
+    pub fn get_callees_filtered(
+        &self,
+        function_name: &str,
+        language: Option<&str>,
+        path_glob: Option<&str>,
+    ) -> Result<Vec<CallRecord>> {
+        self.calls_filtered("c.caller", function_name, language, path_glob)
     }
 
     /// Найти все вызовы, где данная функция является callee
@@ -1861,24 +1861,60 @@ impl Storage {
         function_name: &str,
         language: Option<&str>,
     ) -> Result<Vec<CallRecord>> {
-        match language {
-            Some(lang) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
-                     FROM calls c JOIN files fi ON fi.id = c.file_id
-                     WHERE c.callee = ?1 AND fi.language = ?2",
-                )?;
-                let rows = stmt.query_map(params![function_name, lang], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
-                )?;
-                let rows = stmt.query_map(params![function_name], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
+        self.get_callers_filtered(function_name, language, None)
+    }
+
+    /// Как [`Self::get_callers`], но с фильтром по пути файла-ИСТОЧНИКА вызова
+    /// (обоснование — [`Self::get_callees_filtered`]).
+    pub fn get_callers_filtered(
+        &self,
+        function_name: &str,
+        language: Option<&str>,
+        path_glob: Option<&str>,
+    ) -> Result<Vec<CallRecord>> {
+        self.calls_filtered("c.callee", function_name, language, path_glob)
+    }
+
+    /// Общий запрос по таблице `calls`: `column` — `c.caller` либо `c.callee`.
+    ///
+    /// Условия собираются динамически (язык и glob по пути файла), поэтому
+    /// плейсхолдеры анонимные (`?`), а привязка — позиционная, в порядке
+    /// добавления условий.
+    fn calls_filtered(
+        &self,
+        column: &str,
+        function_name: &str,
+        language: Option<&str>,
+        path_glob: Option<&str>,
+    ) -> Result<Vec<CallRecord>> {
+        let mut conds: Vec<String> = vec![format!("{column} = ?")];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(function_name.to_string())];
+        if let Some(lang) = language {
+            conds.push("fi.language = ?".to_string());
+            params_dyn.push(Box::new(lang.to_string()));
+        }
+        if let Some(g) = path_glob.filter(|g| !g.trim().is_empty()) {
+            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+            let variants = expand_glob_variants(g);
+            conds.push(format!(
+                "({})",
+                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+            ));
+            for v in variants {
+                params_dyn.push(Box::new(normalize_glob(&v)));
             }
         }
+        let sql = format!(
+            "SELECT c.id, c.file_id, c.caller, c.callee, c.line FROM calls c \
+             JOIN files fi ON fi.id = c.file_id WHERE {}",
+            conds.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), row_to_call)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Кратчайший путь A→B в универсальном графе вызовов (итеративный cycle-safe BFS по `calls`).
@@ -4666,6 +4702,62 @@ mod tests {
             })
             .collect();
         storage.insert_calls(&calls).unwrap();
+    }
+
+    /// Фильтр по пути файла-ИСТОЧНИКА вызова (issue #22): у одноимённых
+    /// методов (`Dispose`, `RunAsync`) вызовы разных файлов различаются только
+    /// путём, и без фильтра они слиты в один список.
+    #[test]
+    fn callers_and_callees_filter_by_source_path() {
+        let storage = Storage::open_in_memory().unwrap();
+        let a = storage.upsert_file(&make_file("/src/a.py")).unwrap();
+        let b = storage.upsert_file(&make_file("/src/nested/b.py")).unwrap();
+        seed_calls(&storage, a, &[("RunAsync", "Dispose")]);
+        seed_calls(&storage, b, &[("RunAsync", "Dispose")]);
+
+        // Без фильтра — оба ребра.
+        assert_eq!(storage.get_callers("Dispose", None).unwrap().len(), 2);
+        // Ровно один файл.
+        assert_eq!(
+            storage
+                .get_callers_filtered("Dispose", None, Some("/src/a.py"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Glob: `*` в SQLite GLOB матчит и `/`, поэтому вложенный файл
+        // находится по хвосту имени.
+        assert_eq!(
+            storage
+                .get_callers_filtered("Dispose", None, Some("*b.py"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(storage
+            .get_callers_filtered("Dispose", None, Some("*нет*"))
+            .unwrap()
+            .is_empty());
+        // Зеркало — по вызывающему.
+        assert_eq!(
+            storage
+                .get_callees_filtered("RunAsync", None, Some("*a.py"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Язык и путь складываются: чужой язык отсекает всё.
+        assert!(storage
+            .get_callers_filtered("Dispose", Some("rust"), Some("*a.py"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .get_callers_filtered("Dispose", Some("python"), Some("*a.py"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

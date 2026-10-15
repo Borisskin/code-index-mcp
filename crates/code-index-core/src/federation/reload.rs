@@ -30,6 +30,56 @@ pub struct ReloadResult {
     pub finished_at_unix: u64,
 }
 
+/// Секции `daemon.toml`, которые serve читает ТОЛЬКО при старте.
+///
+/// `[mcp]` (массовый режим, сессионный отсев, алиас по умолчанию, предел
+/// времени вызова), `[tools].enabled` (whitelist инструментов) и `[cap]`
+/// (страж размера ответа) зашиваются в объект сервера и в глобальные настройки
+/// выдачи один раз, при сборке. Перечитка их не применяет — и раньше об этом
+/// молчала: после правки `[mcp]` в журнале стояло «перечитана без изменений», а
+/// в ответе `reloaded: true`, и оператор искал причину в другом месте
+/// (issue #22). Теперь имена разошедшихся секций попадают в `restart_required`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartupOnlySections {
+    /// Канонический JSON секции `[mcp]`, снятый при старте serve.
+    pub mcp: String,
+    /// Канонический JSON секции `[tools]`.
+    pub tools: String,
+    /// Канонический JSON секции `[cap]`.
+    pub cap: String,
+}
+
+impl StartupOnlySections {
+    /// Снять отпечатки секций с прочитанного `daemon.toml`.
+    ///
+    /// Сравниваются сериализованные значения, а не поля по отдельности: секции
+    /// растут, и новая настройка не должна забываться в проверке (её отсутствие
+    /// в отпечатке = «правка не замечена»).
+    pub fn of(cfg: &daemon_config::DaemonFileConfig) -> Self {
+        let one = |v: serde_json::Value| serde_json::to_string(&v).unwrap_or_default();
+        Self {
+            mcp: one(serde_json::to_value(&cfg.mcp).unwrap_or(serde_json::Value::Null)),
+            tools: one(serde_json::to_value(&cfg.tools).unwrap_or(serde_json::Value::Null)),
+            cap: one(serde_json::to_value(&cfg.cap).unwrap_or(serde_json::Value::Null)),
+        }
+    }
+
+    /// Имена секций, разошедшихся с применёнными при старте.
+    pub fn changed(&self, applied: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mcp != applied.mcp {
+            out.push("[mcp]".to_string());
+        }
+        if self.tools != applied.tools {
+            out.push("[tools]".to_string());
+        }
+        if self.cap != applied.cap {
+            out.push("[cap]".to_string());
+        }
+        out
+    }
+}
+
 /// Общий объект для file-watch и ручного `POST /reload`.
 #[derive(Clone)]
 pub struct ServeConfigReloader {
@@ -39,11 +89,17 @@ pub struct ServeConfigReloader {
     daemon_path: PathBuf,
     applied_me_ip: String,
     applied_pool: PoolConfig,
+    /// Отпечатки секций, которые перечиткой не применяются (см.
+    /// [`StartupOnlySections`]). Сравниваются с текущим файлом и попадают в
+    /// `restart_required`, чтобы «правка не подхватилась» было видно из ответа,
+    /// а не выяснялось чтением исходников.
+    applied_startup_only: StartupOnlySections,
     lock: Arc<Mutex<()>>,
     generation: Arc<AtomicU64>,
 }
 
 impl ServeConfigReloader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: CodeIndexServer,
         allowed: Arc<ArcSwap<HashSet<IpAddr>>>,
@@ -51,6 +107,7 @@ impl ServeConfigReloader {
         daemon_path: PathBuf,
         applied_me_ip: String,
         applied_pool: PoolConfig,
+        applied_startup_only: StartupOnlySections,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             server,
@@ -59,6 +116,7 @@ impl ServeConfigReloader {
             daemon_path: absolute_path(&daemon_path)?,
             applied_me_ip,
             applied_pool,
+            applied_startup_only,
             lock: Arc::new(Mutex::new(())),
             generation: Arc::new(AtomicU64::new(0)),
         })
@@ -125,7 +183,17 @@ impl ServeConfigReloader {
             );
         }
 
-        let mut restart_required = Vec::new();
+        // Секции, которые перечитка НЕ применяет: их правка требует перезапуска
+        // именно serve (issue #22). Раньше они не отличались от «ничего не
+        // изменилось», и журнал утверждал, что конфигурация перечитана.
+        let mut restart_required =
+            StartupOnlySections::of(&daemon_cfg).changed(&self.applied_startup_only);
+        if !restart_required.is_empty() {
+            tracing::warn!(
+                sections = ?restart_required,
+                "правка этих секций daemon.toml перечиткой не применяется — нужен перезапуск serve"
+            );
+        }
         if pool_differs(serve_cfg.pool.resolve(), self.applied_pool) {
             restart_required.push("[pool]".to_string());
         }
@@ -361,6 +429,7 @@ mod tests {
             daemon_path.clone(),
             serve_cfg.me.ip,
             serve_cfg.pool.resolve(),
+            StartupOnlySections::of(&daemon_cfg),
         )
         .unwrap();
         Fixture {
@@ -593,6 +662,41 @@ mod tests {
         assert!(result.reloaded);
         assert_eq!(result.generation, 0);
         assert!(result.added.is_empty() && result.removed.is_empty() && result.changed.is_empty());
+        assert!(result.restart_required.is_empty());
+    }
+
+    /// Правка `[mcp]` перечиткой не применяется — и это должно быть ВИДНО из
+    /// результата: иначе оператор считает конфигурацию применённой (issue #22).
+    #[tokio::test]
+    async fn mcp_section_change_is_reported_as_restart_required() {
+        let f = remote_fixture();
+        fs::write(
+            &f.daemon_path,
+            "[mcp]\nmass_mode_tools = [\"get_object_structure\"]\n",
+        )
+        .unwrap();
+
+        let result = f.reloader.reload().await;
+        assert!(result.reloaded);
+        assert_eq!(result.restart_required, vec!["[mcp]".to_string()]);
+    }
+
+    /// То же для whitelist инструментов и стража размера ответа.
+    #[tokio::test]
+    async fn tools_and_cap_changes_are_reported_as_restart_required() {
+        let f = remote_fixture();
+        fs::write(
+            &f.daemon_path,
+            "[tools]\nenabled = [\"read_file\"]\n\n[cap]\nmax_response_bytes = 20000\n",
+        )
+        .unwrap();
+
+        let result = f.reloader.reload().await;
+        assert!(result.reloaded);
+        assert_eq!(
+            result.restart_required,
+            vec!["[tools]".to_string(), "[cap]".to_string()]
+        );
     }
 
     #[tokio::test]

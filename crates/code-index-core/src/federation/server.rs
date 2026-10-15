@@ -154,7 +154,7 @@ async fn handle_get_callers(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_callers(&entry, p.function_name, p.language, p.limit).await)
+    ok_json(tools::get_callers(&entry, p.function_name, p.language, p.limit, p.path_glob).await)
 }
 
 async fn handle_get_callees(
@@ -165,7 +165,7 @@ async fn handle_get_callees(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_callees(&entry, p.function_name, p.language, p.limit).await)
+    ok_json(tools::get_callees(&entry, p.function_name, p.language, p.limit, p.path_glob).await)
 }
 
 async fn handle_find_path(

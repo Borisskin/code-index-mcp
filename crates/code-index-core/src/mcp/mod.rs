@@ -168,6 +168,11 @@ pub struct FunctionNameParams {
     /// Cap на число рёбер графа вызовов (default 200). При обрезке в ответе —
     /// {truncated, total, limit}. Защищает от мегабайтных ответов на «горячих» функциях.
     pub limit: Option<usize>,
+    /// Glob по ПУТИ ФАЙЛА-ИСТОЧНИКА вызова (SQL-pushdown). Нужен там, где имя
+    /// неоднозначно: у `Dispose`, `RunAsync`, `new` вызовы разных классов
+    /// ложатся в один список, а класса (типа приёмника) в ребре графа нет —
+    /// отбор по файлу остаётся единственным проверяемым сужением.
+    pub path_glob: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -197,6 +202,11 @@ pub struct CallTreeParams {
     pub direction: Option<String>,
     /// Глубина дерева (число уровней), [1..10]. По умолчанию 3.
     pub max_depth: Option<i64>,
+    /// Алиас для `max_depth`: у соседних инструментов (и в системных промптах)
+    /// тот же смысл носит короткое имя `depth`. Ключ принимался молча и не
+    /// применялся — обход шёл на дефолтной глубине (issue #22). Если заданы
+    /// оба, главнее `max_depth`.
+    pub depth: Option<i64>,
     /// Cap на число рёбер, [1..5000]. По умолчанию 200; при обрезке — truncated=true.
     pub max_nodes: Option<i64>,
     /// Опциональный фильтр по языку файла-источника ребра.
@@ -245,6 +255,9 @@ pub struct GrepBodyParams {
     pub limit: Option<usize>,
     /// Glob по path для сужения поиска. SQL-pushdown.
     pub path_glob: Option<String>,
+    /// Алиас для `path_glob` — как у `grep_code`/`grep_text`: одно имя не должно
+    /// значить в семействе разное (issue #22).
+    pub glob: Option<String>,
     /// Сколько строк до/после совпадения возвращать в `context`.
     /// 0 (по умолчанию) — без контекста, как раньше.
     pub context_lines: Option<usize>,
@@ -293,6 +306,12 @@ pub struct ReadFileParams {
     pub line_start: Option<usize>,
     /// 1-based, inclusive. None — до конца.
     pub line_end: Option<usize>,
+    /// Алиас для `line_start` — так называется начало диапазона у встроенных
+    /// инструментов чтения и у соседних MCP-серверов. Раньше ключ отбрасывался
+    /// молча, и вместо строк 1-5 приходил файл целиком (issue #22).
+    pub start_line: Option<usize>,
+    /// Алиас для `line_end` (см. `start_line`).
+    pub end_line: Option<usize>,
 }
 
 /// Свести входные ключи grep-инструментов к одному регулярному выражению.
@@ -315,6 +334,30 @@ pub fn grep_regex_from_params(
     filled(pattern).map(|p| format!("(?i){}", ::regex::escape(&p)))
 }
 
+/// Свести ключи фильтра по пути к одному значению.
+///
+/// Приоритет: `path_glob` → `glob` (алиас: так называется тот же фильтр у
+/// встроенного поиска в ряде клиентов). Пустая строка равносильна незаданному
+/// ключу. Молча отброшенный `glob` — худший исход из возможных: ответ выглядит
+/// исправным, а отбор не сработал (issue #22).
+pub fn path_glob_from_params(path_glob: Option<String>, glob: Option<String>) -> Option<String> {
+    let filled = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    filled(path_glob).or_else(|| filled(glob))
+}
+
+/// Свести ключи диапазона строк `read_file` к канонической паре.
+///
+/// Приоритет: `line_start`/`line_end` → `start_line`/`end_line` (имена
+/// встроенных инструментов чтения и соседних MCP-серверов).
+pub fn read_range_from_params(
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    (line_start.or(start_line), line_end.or(end_line))
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepTextParams {
     /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
@@ -333,6 +376,10 @@ pub struct GrepTextParams {
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе работает full-scan по всем text-файлам.
     pub path_glob: Option<String>,
+    /// Алиас для `path_glob` — так называется тот же фильтр у встроенного
+    /// поиска в ряде клиентов. Ключ отбрасывался молча, и ответ без отбора
+    /// выглядел исправным (issue #22). Если заданы оба, главнее `path_glob`.
+    pub glob: Option<String>,
     pub language: Option<String>,
     /// Максимум находок в ответе (default 100; при заданном path_glob/language — 500). При обрезке — `truncated=true`.
     pub limit: Option<usize>,
@@ -358,6 +405,10 @@ pub struct GrepCodeParams {
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
     pub path_glob: Option<String>,
+    /// Алиас для `path_glob` (см. одноимённое поле `grep_text`): молча
+    /// отброшенный ключ опаснее отказа — ответ выглядит исправным, а отбор не
+    /// сработал (issue #22).
+    pub glob: Option<String>,
     pub language: Option<String>,
     /// Максимум совпадений в ответе. Default 100. При достижении — `truncated=true`.
     pub limit: Option<usize>,
@@ -1334,7 +1385,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord. Для 1С к вызовам из кода добавляются декларативные привязки (поле kind): обработчик события формы, обработчик команды формы (binding=command), подписка на событие, перехват расширением, обработчик по соглашению об имени — вызова в коде у них нет, процедуру зовёт платформа."
+        description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord. Для 1С к вызовам из кода добавляются декларативные привязки (поле kind): обработчик события формы, обработчик команды формы (binding=command), подписка на событие, перехват расширением, обработчик по соглашению об имени — вызова в коде у них нет, процедуру зовёт платформа. path_glob — фильтр по пути файла-ИСТОЧНИКА вызова: на одноимённых методах (`Dispose`, `RunAsync`) вызовы разных классов идут одним списком, и сузить его можно только файлом; тогда же в ответе появляется `ambiguous_name` с перечнем определений этого имени."
     )]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -1351,11 +1402,11 @@ impl CodeIndexServer {
             )
             .await;
         }
-        tools::get_callers(&entry, p.function_name, p.language, p.limit).await
+        tools::get_callers(&entry, p.function_name, p.language, p.limit, p.path_glob).await
     }
 
     #[tool(
-        description = "Что вызывает данная функция (callees) — весь список за ОДИН вызов. В каждой записи уже есть caller, callee, line, path файла с вызовом, а для однозначных имён ещё и callee_path/callee_line — место, где вызываемая процедура ОПРЕДЕЛЕНА. Искать каждое вызываемое имя отдельным find_symbol/get_function НЕ нужно; если callee_path нет, значит имя носят несколько процедур — тогда спрашивай их одним grep_code с перечислением через | , а не по вызову на имя. limit — cap (default 200); при обрезке {truncated,total,limit}. Цепочка до конкретной функции — find_path, дерево на несколько уровней — get_call_tree."
+        description = "Что вызывает данная функция (callees) — весь список за ОДИН вызов. В каждой записи уже есть caller, callee, line, path файла с вызовом, а для однозначных имён ещё и callee_path/callee_line — место, где вызываемая процедура ОПРЕДЕЛЕНА. Искать каждое вызываемое имя отдельным find_symbol/get_function НЕ нужно; если callee_path нет, значит имя носят несколько процедур — тогда спрашивай их одним grep_code с перечислением через | , а не по вызову на имя. limit — cap (default 200); при обрезке {truncated,total,limit}. Цепочка до конкретной функции — find_path, дерево на несколько уровней — get_call_tree. path_glob — фильтр по пути файла-источника вызова; если имя делят несколько функций, в ответе есть `ambiguous_name` с их определениями."
     )]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -1372,7 +1423,7 @@ impl CodeIndexServer {
             )
             .await;
         }
-        tools::get_callees(&entry, p.function_name, p.language, p.limit).await
+        tools::get_callees(&entry, p.function_name, p.language, p.limit, p.path_glob).await
     }
 
     #[tool(
@@ -1397,13 +1448,18 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Для 1С обход ВВЕРХ добавляет платформенные точки входа, которых нет в таблице calls: событие и команда формы, подписка на событие, перехват расширением, обработчик по соглашению об имени. Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}."
+        description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth (синоним depth) по умолчанию 3, [1..10]; max_nodes cap (default 200). Для 1С обход ВВЕРХ добавляет платформенные точки входа, которых нет в таблице calls: событие и команда формы, подписка на событие, перехват расширением, обработчик по соглашению об имени. Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}."
     )]
-    async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
+    async fn get_call_tree(&self, Parameters(mut p): Parameters<CallTreeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
         };
+        // `depth` — алиас `max_depth` (см. CallTreeParams). Сводим ДО пересылки:
+        // узел на прежней сборке алиаса не знает и обошёл бы дерево на дефолте.
+        let max_depth = p.max_depth.or(p.depth);
+        p.max_depth = max_depth;
+        p.depth = None;
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
@@ -1418,7 +1474,7 @@ impl CodeIndexServer {
         let options = tools::CallTreeOptions {
             root: p.root,
             direction: p.direction,
-            max_depth: p.max_depth,
+            max_depth,
             max_nodes: p.max_nodes,
             language: p.language,
             max_response_bytes: p.max_response_bytes,
@@ -1545,13 +1601,18 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Поиск ТОЛЬКО в телах функций и классов (module-level код — объявления Перем, таблицы инициализации/маршрутизации, константы и строковые литералы ВНЕ процедур — НЕ виден; для поиска по всему файлу бери grep_code). Плюс grep_body в том, что показывает, в какой ИМЕННО функции/классе найден паттерн. pattern — буквальная подстрока без учёта регистра (кириллица тоже; `%` и `_` — обычные символы), regex — регулярное выражение; query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\"."
+        description = "Поиск ТОЛЬКО в телах функций и классов (module-level код — объявления Перем, таблицы инициализации/маршрутизации, константы и строковые литералы ВНЕ процедур — НЕ виден; для поиска по всему файлу бери grep_code). Плюс grep_body в том, что показывает, в какой ИМЕННО функции/классе найден паттерн. pattern — буквальная подстрока без учёта регистра (кириллица тоже; `%` и `_` — обычные символы), regex — регулярное выражение; query — алиас regex. path_glob (синоним glob=) — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\"."
     )]
-    async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
+    async fn grep_body(&self, Parameters(mut p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
         };
+        // `glob` — алиас `path_glob` (issue #22): сводим ДО пересылки, узел на
+        // прежней сборке алиаса не знает и вернул бы выдачу без отбора.
+        let path_glob = path_glob_from_params(p.path_glob.clone(), p.glob.clone());
+        p.path_glob = path_glob.clone();
+        p.glob = None;
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
@@ -1573,7 +1634,7 @@ impl CodeIndexServer {
             regex,
             p.language,
             p.limit,
-            p.path_glob,
+            path_glob,
             p.context_lines,
         )
         .await
@@ -1622,13 +1683,22 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Прочитать содержимое файла из индекса. ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ."
+        description = "Прочитать содержимое файла из индекса. ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end (синонимы start_line/end_line) — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ."
     )]
-    async fn read_file(&self, Parameters(p): Parameters<ReadFileParams>) -> String {
+    async fn read_file(&self, Parameters(mut p): Parameters<ReadFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
         };
+        // Ключи диапазона сводим ДО пересылки: узел может быть на сборке, где
+        // алиасов `start_line`/`end_line` ещё нет, и при разборе они бы
+        // потерялись — вместо строк 1-5 пришёл бы файл целиком (issue #22).
+        let (line_start, line_end) =
+            read_range_from_params(p.line_start, p.line_end, p.start_line, p.end_line);
+        p.line_start = line_start;
+        p.line_end = line_end;
+        p.start_line = None;
+        p.end_line = None;
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
@@ -1639,11 +1709,11 @@ impl CodeIndexServer {
             )
             .await;
         }
-        tools::read_file(&entry, p.path, p.line_start, p.line_end).await
+        tools::read_file(&entry, p.path, line_start, line_end).await
     }
 
     #[tool(
-        description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
+        description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
     )]
     async fn grep_text(&self, Parameters(mut p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -1656,12 +1726,17 @@ impl CodeIndexServer {
             Some(r) => r,
             None => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для кода .bsl/.py/.rs — grep_code; для тел функций — grep_body.\"}".to_string(),
         };
+        // `glob` — алиас `path_glob` (issue #22): ключ отбрасывался молча, и
+        // выдача без отбора выглядела исправной.
+        let path_glob = path_glob_from_params(p.path_glob.clone(), p.glob.clone());
         if !entry.is_local {
             // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
             // поля `pattern` ещё нет, и при разборе оно бы потерялось.
             p.regex = Some(regex);
             p.query = None;
             p.pattern = None;
+            p.path_glob = path_glob.clone();
+            p.glob = None;
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
                 &entry.ip,
@@ -1674,7 +1749,7 @@ impl CodeIndexServer {
         tools::grep_text(
             &entry,
             regex,
-            p.path_glob,
+            path_glob,
             p.language,
             p.limit,
             p.context_lines,
@@ -1683,7 +1758,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
+        description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
     )]
     async fn grep_code(&self, Parameters(mut p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -1696,12 +1771,17 @@ impl CodeIndexServer {
             Some(r) => r,
             None => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для тел функций/классов — grep_body; для xml/md/yaml — grep_text.\"}".to_string(),
         };
+        // `glob` — алиас `path_glob` (issue #22): ключ отбрасывался молча, и
+        // выдача без отбора выглядела исправной.
+        let path_glob = path_glob_from_params(p.path_glob.clone(), p.glob.clone());
         if !entry.is_local {
             // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
             // поля `pattern` ещё нет, и при разборе оно бы потерялось.
             p.regex = Some(regex);
             p.query = None;
             p.pattern = None;
+            p.path_glob = path_glob.clone();
+            p.glob = None;
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
                 &entry.ip,
@@ -1714,7 +1794,7 @@ impl CodeIndexServer {
         tools::grep_code(
             &entry,
             regex,
-            p.path_glob,
+            path_glob,
             p.language,
             p.limit,
             p.context_lines,
@@ -1912,6 +1992,95 @@ fn meta_dependent_files(meta: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Ключи аргументов, которых нет в схеме инструмента (issue #22).
+///
+/// Сервер такие ключи не применяет (serde отбрасывает их молча), но и не
+/// отбивает вызов: ответ получает поля `unknown_params` и
+/// `unknown_params_note`, чтобы «отбор не сработал» было видно из самого
+/// ответа, а не выяснялось чтением схемы инструмента.
+#[derive(Debug, Clone, Default)]
+struct UnknownParams {
+    /// Имена нераспознанных ключей (отсортированы).
+    names: Vec<String>,
+    /// Ключи, которые инструмент принимает (отсортированы): называем их в
+    /// примечании, чтобы вызов можно было исправить, не заглядывая в схему.
+    allowed: Vec<String>,
+}
+
+/// Дописать в готовый ответ перечень нераспознанных ключей.
+///
+/// Формы ответа те же, что у `strip_meta`: вложенный JSON в `content[*].text`
+/// (ответы core-tools) и `structuredContent` (structured output). Правка идёт
+/// по сериализованному `CallToolResult`; при любой неожиданности возвращается
+/// исходный результат — предупреждение не должно ломать ответ.
+fn annotate_unknown_params(result: CallToolResult, unknown: &UnknownParams) -> CallToolResult {
+    if unknown.names.is_empty() {
+        return result;
+    }
+    let mut value = match serde_json::to_value(&result) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    let allowed_note = if unknown.allowed.is_empty() {
+        "Инструмент не принимает параметров.".to_string()
+    } else {
+        format!(
+            "Допустимые ключи этого инструмента: {}.",
+            unknown.allowed.join(", ")
+        )
+    };
+    let payload = serde_json::json!({
+        "unknown_params": &unknown.names,
+        "unknown_params_note": format!(
+            "Ключ(и) не распознаны сервером и не применены: {}. Ответ мог быть построен без \
+             запрошенного отбора. {}",
+            unknown.names.join(", "),
+            allowed_note
+        ),
+    });
+    let mut patched = false;
+    if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for item in content.iter_mut() {
+            let text = match item.get("text").and_then(|t| t.as_str()) {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(obj) = inner.as_object_mut() else {
+                continue;
+            };
+            if let Some(extra) = payload.as_object() {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            if let Ok(s) = serde_json::to_string(&inner) {
+                if let Some(slot) = item.get_mut("text") {
+                    *slot = serde_json::Value::String(s);
+                    patched = true;
+                }
+            }
+        }
+    }
+    if let Some(sc) = value
+        .get_mut("structuredContent")
+        .and_then(|s| s.as_object_mut())
+    {
+        if let Some(extra) = payload.as_object() {
+            for (k, v) in extra {
+                sc.insert(k.clone(), v.clone());
+            }
+            patched = true;
+        }
+    }
+    if !patched {
+        return result;
+    }
+    serde_json::from_value(value).unwrap_or(result)
+}
+
 impl CodeIndexServer {
     /// Ключ кэша для (tool, args), если репо локальный и инструмент кэшируем.
     /// `None` → не кэшировать: remote-репо (federation инвалидируется на
@@ -2013,6 +2182,45 @@ impl CodeIndexServer {
         false
     }
 
+    /// Ключи аргументов, которых нет в схеме инструмента.
+    ///
+    /// Проверяются только core-tools: их схема порождается из params-структуры
+    /// и потому полна — всё, что сервер умеет прочесть, в ней объявлено. У
+    /// extension-tools схема написана руками, а у части из них имя ключа вообще
+    /// не значимо (`tools::object_value` берёт значение первого неслужебного
+    /// параметра) — предупреждение там было бы ложным.
+    fn unknown_params(
+        &self,
+        name: &str,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> UnknownParams {
+        let Some(arguments) = arguments else {
+            return UnknownParams::default();
+        };
+        let Some(tool) = self.tool_router.get(name) else {
+            return UnknownParams::default();
+        };
+        let Some(props) = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+        else {
+            return UnknownParams::default();
+        };
+        let mut names: Vec<String> = arguments
+            .keys()
+            .filter(|k| !props.contains_key(*k))
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            return UnknownParams::default();
+        }
+        names.sort();
+        let mut allowed: Vec<String> = props.keys().cloned().collect();
+        allowed.sort();
+        UnknownParams { names, allowed }
+    }
+
     /// Финальная обработка результата перед отдачей клиенту: сессионный дедуп
     /// ре-доставки (опустить строки табличного результата, уже отданные в ЭТОЙ
     /// сессии). Применяется ПОСЛЕ кэша — кэш хранит ПОЛНЫЙ результат
@@ -2023,6 +2231,7 @@ impl CodeIndexServer {
         session_id: &Option<String>,
         dedup_scope: &str,
         result: Result<CallToolResult, ErrorData>,
+        unknown: &UnknownParams,
     ) -> Result<CallToolResult, ErrorData> {
         let Ok(res) = &result else {
             return result;
@@ -2030,7 +2239,10 @@ impl CodeIndexServer {
         if res.is_error.unwrap_or(false) {
             return result;
         }
-        let Ok(s) = serde_json::to_string(res) else {
+        // Нераспознанные ключи дописываем ДО дедупа и среза `_meta`: ответ на
+        // повторный вызов тоже должен их нести.
+        let annotated = annotate_unknown_params(res.clone(), unknown);
+        let Ok(s) = serde_json::to_string(&annotated) else {
             return result;
         };
         // 1. Сессионный дедуп ре-доставки (опустить уже отданные в этой сессии
@@ -2043,13 +2255,13 @@ impl CodeIndexServer {
         // 2. Срез служебного `_meta` перед отдачей клиенту (раньше это делал
         //    прокси mcp-cache-ci; теперь serve самодостаточен в ci-цепочке).
         let (s, meta_stripped) = strip_meta(&s);
-        // Ничего не изменилось → отдаём исходный результат без лишней пересборки.
+        // Ничего не изменилось → отдаём уже дополненный результат без пересборки.
         if elided == 0 && !meta_stripped {
-            return result;
+            return Ok(annotated);
         }
         match serde_json::from_str::<CallToolResult>(&s) {
             Ok(new_res) => Ok(new_res),
-            Err(_) => result,
+            Err(_) => Ok(annotated),
         }
     }
 
@@ -2078,6 +2290,7 @@ impl CodeIndexServer {
             session_id,
             dedup_scope,
             Ok(CallToolResult::error(vec![Content::text(text)])),
+            &UnknownParams::default(),
         )
     }
 }
@@ -2160,6 +2373,12 @@ impl ServerHandler for CodeIndexServer {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         tracing::debug!(session = ?session_id, tool = %request.name.as_ref(), "call_tool");
+
+        // Ключи, которых нет в схеме инструмента, serde отбрасывает молча:
+        // ответ выглядит исправным, а отбор не сработал (issue #22). Считаем их
+        // до разбора аргументов — и дописываем в каждый ответ этого вызова
+        // (включая ответ из кэша и ответ extension-tool).
+        let unknown = self.unknown_params(request.name.as_ref(), request.arguments.as_ref());
 
         // 0. Whitelist-проверка ДО router-диспетча. Модель может вызвать
         // tool, отсутствующий в `tools/list` (из системного промпта, из
@@ -2263,7 +2482,7 @@ impl ServerHandler for CodeIndexServer {
                 let repo = repo_opt.as_deref().unwrap_or("");
                 if !self.response_is_stale(repo, &payload) {
                     if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
-                        return self.finish(&session_id, &dedup_scope, Ok(res));
+                        return self.finish(&session_id, &dedup_scope, Ok(res), &unknown);
                     }
                 }
             }
@@ -2289,7 +2508,7 @@ impl ServerHandler for CodeIndexServer {
                 &r,
                 epoch_before,
             );
-            return self.finish(&session_id, &dedup_scope, r);
+            return self.finish(&session_id, &dedup_scope, r, &unknown);
         }
         // 2. Иначе — extension-tools. Ищем по имени.
         let tool_name = request.name.as_ref();
@@ -2361,6 +2580,7 @@ impl ServerHandler for CodeIndexServer {
                 &session_id,
                 &dedup_scope,
                 Ok(CallToolResult::structured(value)),
+                &unknown,
             );
         }
         // Раньше локальные extension-tools не проверяли готовность; удалённую ветку проверяет нода.
@@ -2378,6 +2598,7 @@ impl ServerHandler for CodeIndexServer {
                 &session_id,
                 &dedup_scope,
                 Ok(CallToolResult::structured(value)),
+                &unknown,
             );
         }
         let storage = entry.storage_pool();
@@ -2391,6 +2612,7 @@ impl ServerHandler for CodeIndexServer {
                 &session_id,
                 &dedup_scope,
                 Ok(CallToolResult::structured(value)),
+                &unknown,
             );
         }
         let root_path: Option<&Path> = entry.root_path.as_deref();
@@ -2429,7 +2651,7 @@ impl ServerHandler for CodeIndexServer {
             &r,
             epoch_before,
         );
-        self.finish(&session_id, &dedup_scope, r)
+        self.finish(&session_id, &dedup_scope, r, &unknown)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -2965,6 +3187,203 @@ mod param_alias_tests {
             serde_json::from_value(serde_json::json!({"repo": "ut", "pattern": "ИмяФункции"}))
                 .expect("grep_text должен принимать pattern");
         assert_eq!(text.pattern.as_deref(), Some("ИмяФункции"));
+    }
+
+    // ── Синонимы ключей, которые раньше отбрасывались молча (issue #22) ─────
+
+    // `glob` — то же, что `path_glob`: так называется фильтр у встроенного
+    // поиска в ряде клиентов. Отброшенный ключ давал ответ без отбора, внешне
+    // неотличимый от правильного.
+    #[test]
+    fn glob_принимается_как_синоним_path_glob() {
+        let code: GrepCodeParams = serde_json::from_value(
+            serde_json::json!({"repo": "cs", "regex": "Bootstrap", "glob": "**/Core/**"}),
+        )
+        .expect("grep_code должен принимать glob");
+        assert_eq!(code.glob.as_deref(), Some("**/Core/**"));
+        assert_eq!(
+            path_glob_from_params(code.path_glob, code.glob).as_deref(),
+            Some("**/Core/**")
+        );
+
+        // Заданы оба — главнее канонический ключ.
+        let both: GrepCodeParams = serde_json::from_value(
+            serde_json::json!({"repo": "cs", "regex": "x", "glob": "*.md", "path_glob": "src/**"}),
+        )
+        .expect("оба ключа принимаются");
+        assert_eq!(
+            path_glob_from_params(both.path_glob, both.glob).as_deref(),
+            Some("src/**")
+        );
+
+        // Пустой алиас не должен маскировать канонический ключ.
+        assert_eq!(
+            path_glob_from_params(Some("src/**".into()), Some("  ".into())).as_deref(),
+            Some("src/**")
+        );
+
+        // У grep_text тот же ключ.
+        let text: GrepTextParams =
+            serde_json::from_value(serde_json::json!({"repo": "cs", "glob": "**/*.md"}))
+                .expect("grep_text должен принимать glob");
+        assert_eq!(text.glob.as_deref(), Some("**/*.md"));
+    }
+
+    // `start_line`/`end_line` — имена встроенных инструментов чтения: без них
+    // вместо строк 1-5 приходил файл целиком.
+    #[test]
+    fn start_line_и_end_line_сводятся_к_диапазону() {
+        let p: ReadFileParams = serde_json::from_value(serde_json::json!({
+            "repo": "cs", "path": "App/Program.cs", "start_line": 1, "end_line": 5
+        }))
+        .expect("read_file должен принимать start_line/end_line");
+        assert_eq!(
+            read_range_from_params(p.line_start, p.line_end, p.start_line, p.end_line),
+            (Some(1), Some(5))
+        );
+
+        // Канонические ключи главнее.
+        assert_eq!(
+            read_range_from_params(Some(10), Some(20), Some(1), Some(5)),
+            (Some(10), Some(20))
+        );
+    }
+
+    // `depth` — короткое имя `max_depth` у get_call_tree: ключ принимался
+    // молча, а обход шёл на дефолтной глубине.
+    #[test]
+    fn depth_принимается_как_синоним_max_depth() {
+        let p: CallTreeParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "root": "ОбработкаПроведения", "depth": 5}),
+        )
+        .expect("get_call_tree должен принимать depth");
+        assert_eq!(p.depth, Some(5));
+        assert!(p.max_depth.is_none());
+    }
+
+    // get_callers/get_callees принимают сужение по файлу вызова.
+    #[test]
+    fn callers_params_принимают_path_glob() {
+        let p: FunctionNameParams = serde_json::from_value(serde_json::json!({
+            "repo": "cs", "function_name": "Dispose", "path_glob": "**/Api/**"
+        }))
+        .expect("path_glob должен приниматься");
+        assert_eq!(p.path_glob.as_deref(), Some("**/Api/**"));
+    }
+}
+
+// ── Нераспознанные ключи аргументов (issue #22) ───────────────────────────
+
+#[cfg(test)]
+mod unknown_params_tests {
+    use super::*;
+
+    fn server() -> CodeIndexServer {
+        CodeIndexServer::with_repos(std::collections::BTreeMap::new())
+    }
+
+    fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().expect("объект аргументов")
+    }
+
+    // Ключ вне схемы инструмента попадает в список нераспознанных, ключи схемы
+    // — нет: схема ядра порождается из params-структуры и потому полна.
+    #[test]
+    fn неизвестный_ключ_отличается_от_известного() {
+        let unknown = server().unknown_params(
+            "grep_code",
+            Some(&args(serde_json::json!({
+                "repo": "cs", "regex": "Bootstrap", "file_pattern": "**/Core/**"
+            }))),
+        );
+        assert_eq!(unknown.names, vec!["file_pattern".to_string()]);
+        assert!(
+            unknown.allowed.iter().any(|k| k == "path_glob"),
+            "допустимые ключи перечислены: {:?}",
+            unknown.allowed
+        );
+
+        // Синоним, объявленный полем структуры, — уже «известный» ключ.
+        let known = server().unknown_params(
+            "grep_code",
+            Some(&args(
+                serde_json::json!({"repo": "cs", "regex": "x", "glob": "**/Core/**"}),
+            )),
+        );
+        assert!(known.names.is_empty());
+    }
+
+    // Ответ получает и список ключей, и примечание с допустимыми — в форме
+    // core-tool (вложенный JSON в content[*].text).
+    #[test]
+    fn ответ_несёт_неизвестные_ключи_и_допустимые() {
+        let unknown = server().unknown_params(
+            "read_file",
+            Some(&args(
+                serde_json::json!({"repo": "cs", "path": "a.cs", "line_from": 1}),
+            )),
+        );
+        assert_eq!(unknown.names, vec!["line_from".to_string()]);
+
+        let inner = serde_json::json!({"result": {"content": "…"}, "_meta": {}});
+        let res: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": inner.to_string()}],
+        }))
+        .expect("CallToolResult из JSON");
+
+        let patched = annotate_unknown_params(res, &unknown);
+        let value = serde_json::to_value(&patched).expect("сериализация ответа");
+        let text = value["content"][0]["text"]
+            .as_str()
+            .expect("текстовый ответ");
+        let parsed: serde_json::Value = serde_json::from_str(text).expect("валидный JSON");
+        assert_eq!(
+            parsed["unknown_params"],
+            serde_json::json!(["line_from"]),
+            "ключ назван в ответе"
+        );
+        let note = parsed["unknown_params_note"].as_str().expect("примечание");
+        assert!(note.contains("line_from"), "примечание: {note}");
+        assert!(note.contains("line_start"), "допустимые ключи: {note}");
+        assert!(note.contains("start_line"), "синоним тоже допустим: {note}");
+        // Данные ответа не потеряны.
+        assert_eq!(parsed["result"]["content"], serde_json::json!("…"));
+    }
+
+    // Корректный вызов предупреждения не получает: поле не должно появляться
+    // на каждом ответе.
+    #[test]
+    fn корректный_вызов_предупреждения_не_получает() {
+        let unknown = server().unknown_params(
+            "read_file",
+            Some(&args(serde_json::json!({
+                "repo": "cs", "path": "a.cs", "line_start": 1, "line_end": 5
+            }))),
+        );
+        assert!(unknown.names.is_empty());
+
+        let res: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "{\"result\": []}"}],
+        }))
+        .expect("CallToolResult из JSON");
+        let before = serde_json::to_value(&res).unwrap();
+        let after = serde_json::to_value(annotate_unknown_params(res, &unknown)).unwrap();
+        assert_eq!(before, after);
+    }
+
+    // Ответ не в форме JSON (или вообще текст) правкой не ломается.
+    #[test]
+    fn не_json_ответ_проходит_без_изменений() {
+        let unknown = UnknownParams {
+            names: vec!["junk".to_string()],
+            allowed: vec!["repo".to_string()],
+        };
+        let res: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "не json"}],
+        }))
+        .expect("CallToolResult из JSON");
+        let value = serde_json::to_value(annotate_unknown_params(res, &unknown)).unwrap();
+        assert_eq!(value["content"][0]["text"], serde_json::json!("не json"));
     }
 }
 

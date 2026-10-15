@@ -1063,6 +1063,10 @@ async fn cmd_serve(
             daemon_cfg_path.clone(),
             serve_cfg.me.ip.clone(),
             serve_cfg.pool.resolve(),
+            // Отпечатки секций, которые перечитка не применяет (`[mcp]`,
+            // `[tools]`, `[cap]`): их правка назовётся в `restart_required`,
+            // а не растворится в «перечитана без изменений» (issue #22).
+            federation::reload::StartupOnlySections::of(&daemon_cfg),
         )?;
 
         // Языки из daemon.toml применяем ДО старта транспорта: клиент,

@@ -86,6 +86,15 @@ pub(crate) const HINT_CALL_GRAPH_EMPTY: &str = "0 рёбер в графе вы�
 (Выполнить/Вычислить со сборкой имени из строк, типовой паттерн диспетчеров) — \
 проверьте grep_code по фрагменту имени: он найдёт и строковые литералы.";
 
+/// get_callers / get_callees вернул 0 рёбер при заданном фильтре по пути.
+///
+/// Отдельно от [`HINT_CALL_GRAPH_EMPTY`]: там пустота объясняется именем или
+/// отсутствием вызовов, а здесь её мог дать сам фильтр — и подсказка обязана
+/// назвать именно его, иначе отправляет искать ошибку в имени (issue #22).
+pub(crate) const HINT_CALL_GRAPH_EMPTY_WITH_GLOB: &str = "0 рёбер при заданном path_glob= — \
+фильтр по пути файла-ИСТОЧНИКА вызова мог убрать все записи: снимите его или расширьте образец. \
+Имя тоже проверьте — оно должно быть ТОЧНЫМ (без скобок и имени модуля-владельца): get_function/find_symbol.";
+
 /// get_callers вернул декларативные привязки — записи с полем `kind`.
 pub(crate) const HINT_DECLARATIVE_CALLERS: &str = "Часть записей — декларативные привязки \
 (поле kind): вызова в коде у них нет, процедуру выполняет платформа по записи в описании \
@@ -123,7 +132,13 @@ pub(crate) const LOCATION_CAP: usize = 50;
 pub(crate) const HINT_FIND_SYMBOL_EMPTY: &str = "Символ не найден среди функций/классов/переменных/импортов (точное имя, регистр игнорируется). \
 Для нечёткого поиска по словам — search_function/search_class; по коду — grep_code(regex=…).";
 /// grep_code вернул 0 совпадений.
-pub(crate) const HINT_GREP_CODE_EMPTY: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
+///
+/// Про ключ поиска здесь сказано ФАКТОМ (какие ключи принимаются), а не
+/// упрёком «ты назвал параметр неверно»: раньше подсказка печаталась и на
+/// вызове с правильно заданным `pattern=`, и на верном `regex=` — читалось как
+/// ошибка вызывающего там, где её нет (issue #22).
+pub(crate) const HINT_GREP_CODE_EMPTY: &str = "0 совпадений. Ключ поиска — regex= (синтаксис crate regex) \
+либо pattern= (буквальная подстрока, регистр не важен); query= — синоним regex=. \
 Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
 Проверьте language=/path_glob= (oversize-файлы пропускаются).";
 /// grep_body вернул 0 совпадений.
@@ -154,7 +169,8 @@ pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str =
 // серию слепых grep'ов (наблюдение test03: ходы 17/20/21 ушли вслепую, т.к.
 // пустой grep_body не звал в search_terms). std::concat! требует литералы —
 // поэтому хвост выписан в каждой константе целиком (без внешних крейтов).
-pub(crate) const HINT_GREP_CODE_EMPTY_BSL: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
+pub(crate) const HINT_GREP_CODE_EMPTY_BSL: &str = "0 совпадений. Ключ поиска — regex= (синтаксис crate regex) \
+либо pattern= (буквальная подстрока, регистр не важен); query= — синоним regex=. \
 Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
 Проверьте language=/path_glob= (oversize-файлы пропускаются). \
 ▸ grep ищет ТОЧНЫЙ текст в файлах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
@@ -1214,16 +1230,92 @@ pub fn get_class_with(
     }
 }
 
+/// Сколько определений показывать у неоднозначного имени (`ambiguous_name`).
+const AMBIGUOUS_DEFS_SHOWN: usize = 10;
+
+/// Признак неоднозначности имени — общий для `get_callers` и `get_callees`.
+///
+/// В ребре графа вызовов имя — единственный ключ: у `Dispose`, `RunAsync`,
+/// `new` (и у любого обработчика по соглашению в 1С) вызовы РАЗНЫХ функций
+/// ложатся в один список, а различить их внутри записи нечем — ни класса, ни
+/// типа приёмника там нет. Отдаём перечень найденных определений: по нему
+/// видно, сколько функций делят имя, а `path_glob=` даёт отбор по файлу.
+/// `None` — имя однозначно либо не найдено вовсе (внешняя библиотечная
+/// функция: определение живёт вне репозитория).
+fn ambiguous_name_note(
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Option<serde_json::Value> {
+    // Квалифицированное имя (`Модуль.Метод` у 1С) неоднозначным быть не может:
+    // именно оно и лежит в `calls.callee`, отбор идёт по полному совпадению.
+    if function_name.contains('.') {
+        return None;
+    }
+    let defs = storage.get_function_by_name(function_name).ok()?;
+    if defs.len() < 2 {
+        return None;
+    }
+    let shown: Vec<serde_json::Value> = defs
+        .iter()
+        .take(AMBIGUOUS_DEFS_SHOWN)
+        .map(|f| {
+            let mut item = serde_json::Map::new();
+            item.insert(
+                "path".into(),
+                serde_json::json!(lookup_path(storage, f.file_id)),
+            );
+            item.insert("line".into(), serde_json::json!(f.line_start));
+            if let Some(q) = f.qualified_name.as_deref() {
+                item.insert("qualified_name".into(), serde_json::json!(q));
+            }
+            serde_json::Value::Object(item)
+        })
+        .collect();
+    Some(serde_json::json!({
+        "name": function_name,
+        "definitions_total": defs.len(),
+        "definitions": shown,
+        "note": "Имя носят несколько функций: вызовы разных определений идут одним списком. \
+                 Сузьте отбор — path_glob= (glob по файлу вызова) или language=.",
+    }))
+}
+
+/// Пропускает ли фильтр по пути ребро с этим файлом-источником.
+///
+/// `None` (фильтр не задан) — пропускает всё. Ребро без файла в индексе
+/// (`file_id = 0` — источник не разрешился) при заданном фильтре отбрасывается:
+/// подтвердить его путь нечем, а «фильтр применён не ко всем записям» — ровно
+/// тот молчаливый исход, из-за которого заведена issue #22.
+fn keep_by_path(
+    matcher: &Option<globset::GlobSet>,
+    storage: &crate::storage::Storage,
+    file_id: i64,
+) -> bool {
+    match matcher {
+        Some(m) => matches_with(m, &lookup_path(storage, file_id)),
+        None => true,
+    }
+}
+
 pub async fn get_callers(
     entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
     limit: Option<usize>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
-    match storage.get_callers(&function_name, language.as_deref()) {
+    match storage.get_callers_filtered(&function_name, language.as_deref(), path_glob.as_deref()) {
         Ok(mut r) => {
+            // Рёбра, добавленные процессором языка (вызовы с квалификатором и
+            // декларативные привязки), приходят НЕ из SQL — фильтр по пути для
+            // них проверяется здесь. Иначе `path_glob` сузил бы выдачу лишь
+            // частично, а ответ выглядел бы отфильтрованным целиком.
+            let matcher = path_glob
+                .as_deref()
+                .filter(|g| !g.trim().is_empty())
+                .and_then(|g| build_path_matcher(g).ok());
             // Вызовы с квалификатором (1С: `Модуль.Метод`, `Справочники.X.Метод`,
             // `ОбработкаОбъект.Метод` из формы): точный поиск по голому имени их не
             // видит. Дубли по id отбрасываем, порядок — сначала точные совпадения.
@@ -1231,6 +1323,9 @@ pub async fn get_callers(
                 let mut seen: std::collections::HashSet<i64> =
                     r.iter().filter_map(|c| c.id).collect();
                 for c in qualified_callers_of(entry, &storage, &function_name) {
+                    if !keep_by_path(&matcher, &storage, c.file_id) {
+                        continue;
+                    }
                     if c.id.is_none_or(|id| seen.insert(id)) {
                         r.push(c);
                     }
@@ -1264,7 +1359,17 @@ pub async fn get_callers(
             // вызовов кода у неё нет и быть не может. Лимитом не режем —
             // записей единицы: на неоднозначном имени расширение отдаёт не
             // список, а одну запись с подсказкой.
-            let declarative = declarative_callers_of(entry, &storage, &function_name);
+            let declarative: Vec<serde_json::Value> =
+                declarative_callers_of(entry, &storage, &function_name)
+                    .into_iter()
+                    .filter(|d| match &matcher {
+                        Some(m) => d
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|p| matches_with(m, p)),
+                        None => true,
+                    })
+                    .collect();
             deps.extend(
                 declarative
                     .iter()
@@ -1288,7 +1393,19 @@ pub async fn get_callers(
                 }
             } else if r.is_empty() {
                 // На пустом результате — hint (модель повторяет тот же вызов).
-                extra.insert("hint".into(), serde_json::json!(HINT_CALL_GRAPH_EMPTY));
+                // Задан фильтр по пути — называем ФИЛЬТР, а не только имя.
+                extra.insert(
+                    "hint".into(),
+                    serde_json::json!(if matcher.is_some() {
+                        HINT_CALL_GRAPH_EMPTY_WITH_GLOB
+                    } else {
+                        HINT_CALL_GRAPH_EMPTY
+                    }),
+                );
+            }
+            // Имя делят несколько функций — списки их вызовов слиты (issue #22).
+            if let Some(note) = ambiguous_name_note(&storage, &function_name) {
+                extra.insert("ambiguous_name".into(), note);
             }
             let extra = (!extra.is_empty()).then_some(serde_json::Value::Object(extra));
             wrap_with_meta_extra(&storage, &enriched, deps, extra)
@@ -1302,10 +1419,11 @@ pub async fn get_callees(
     function_name: String,
     language: Option<String>,
     limit: Option<usize>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
-    match storage.get_callees(&function_name, language.as_deref()) {
+    match storage.get_callees_filtered(&function_name, language.as_deref(), path_glob.as_deref()) {
         Ok(mut r) => {
             let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
             let total = r.len();
@@ -1416,16 +1534,34 @@ pub async fn get_callees(
                 }
                 enriched.push(rec);
             }
-            let extra = if truncated {
-                Some(serde_json::json!({
-                    "truncated": true, "total": total, "limit": cap,
-                    "hint": "Показаны первые N вызываемых. Уточните limit= для большего числа или сузьте language=.",
-                }))
+            let mut extra = serde_json::Map::new();
+            if truncated {
+                extra.insert("truncated".into(), serde_json::json!(true));
+                extra.insert("total".into(), serde_json::json!(total));
+                extra.insert("limit".into(), serde_json::json!(cap));
+                extra.insert(
+                    "hint".into(),
+                    serde_json::json!(
+                        "Показаны первые N вызываемых. Уточните limit= для большего числа или сузьте language=."
+                    ),
+                );
             } else if r.is_empty() {
-                Some(serde_json::json!({ "hint": HINT_CALL_GRAPH_EMPTY }))
-            } else {
-                None
-            };
+                // Фильтр по пути мог убрать все рёбра — подсказка называет его.
+                let filtered = path_glob.as_deref().is_some_and(|g| !g.trim().is_empty());
+                extra.insert(
+                    "hint".into(),
+                    serde_json::json!(if filtered {
+                        HINT_CALL_GRAPH_EMPTY_WITH_GLOB
+                    } else {
+                        HINT_CALL_GRAPH_EMPTY
+                    }),
+                );
+            }
+            // Имя делят несколько функций — списки их вызовов слиты (issue #22).
+            if let Some(note) = ambiguous_name_note(&storage, &function_name) {
+                extra.insert("ambiguous_name".into(), note);
+            }
+            let extra = (!extra.is_empty()).then_some(serde_json::Value::Object(extra));
             wrap_with_meta_extra(&storage, &enriched, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
@@ -3067,6 +3203,15 @@ mod tests {
             обычный.contains(r"C:\Repo"),
             "обычный путь изменён: {обычный}"
         );
+    }
+
+    /// Пустой ответ при заданном фильтре по пути обязан назвать ФИЛЬТР, а не
+    /// только имя: иначе подсказка отправляет искать ошибку в имени (issue #22).
+    #[test]
+    fn пустой_ответ_с_фильтром_по_пути_называет_фильтр() {
+        assert!(HINT_CALL_GRAPH_EMPTY_WITH_GLOB.contains("path_glob"));
+        assert_ne!(HINT_CALL_GRAPH_EMPTY_WITH_GLOB, HINT_CALL_GRAPH_EMPTY);
+        assert!(!HINT_CALL_GRAPH_EMPTY.contains("path_glob"));
     }
 
     /// M-6: пост-фильтр по образцу пути обязан находить файлы в КОРНЕ репо.
