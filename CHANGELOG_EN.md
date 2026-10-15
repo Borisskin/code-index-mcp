@@ -5,6 +5,19 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.13.1] — 2026-10-15
+
+**Dependency update driven by the security gate: the TLS library carried four advisories.**
+
+### Changed
+
+- **`rustls` 0.23.45 → 0.23.46.** The `cargo deny` gate (`advisories`) in CI flagged four vulnerabilities in the TLS library pulled in through `reqwest` → `hyper-rustls` (the network path used by procedure enrichment): RUSTSEC-2026-0346 (the `Debug` impls of client session values expose TLS secrets), RUSTSEC-2026-0347 (buffered application data is sent to the outer server after ECH rejection), RUSTSEC-2026-0348 (Brotli certificate decompression can allocate up to 1 GiB before authentication), RUSTSEC-2026-0349 (an unauthenticated ServerHello can downgrade later connections to classical key exchange). The fixes require 0.23.46 or newer.
+- **`yoke-derive` 0.8.3 → 0.8.4.** The previous version was yanked — `cargo deny` warned about it separately.
+
+### Compatibility
+
+- Only the dependency lock file changes: the source code, the database schema and the storage format are untouched, so no reindex is required. Tool behaviour is identical to 1.13.0.
+
 ## [1.13.0] — 2026-10-15
 
 **A silent filter and a silent re-read: the response now says a key was not applied, the re-read says a restart is required.**
