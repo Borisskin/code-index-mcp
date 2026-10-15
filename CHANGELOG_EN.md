@@ -5,7 +5,7 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.14.0] — 2026-10-15
 
 **Metadata-property references: the report's main data composition schema is no longer reported as unused.**
 
